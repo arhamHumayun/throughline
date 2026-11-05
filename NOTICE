@@ -1,0 +1,4 @@
+crates/core is derived from diff-core (https://github.com/jamesaphoenix/diff-core),
+commit 7b82ed829fe57b3e4ed36765a5c1b9fb5014f65c, which its Cargo.toml and README
+declare as MIT licensed. The upstream repository ships no LICENSE file at that commit.
+Copyright for the derived code remains with the diff-core authors.
