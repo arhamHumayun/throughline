@@ -1,0 +1,3908 @@
+//! Entrypoint detection module.
+//!
+//! Automatically detects entry points into the application by analyzing
+//! file paths, AST-extracted symbols, imports, call sites, and exports.
+
+use crate::ast::{ImportInfo, Language, ParsedFile};
+use crate::ir::IrFile;
+use crate::types::{Entrypoint, EntrypointType};
+
+/// Detect all entrypoints across a set of parsed files.
+pub fn detect_entrypoints(files: &[ParsedFile]) -> Vec<Entrypoint> {
+    let mut entrypoints = Vec::new();
+    for file in files {
+        detect_file_entrypoints(file, &mut entrypoints);
+    }
+    // Deduplicate by (file, symbol) pair
+    entrypoints.sort_by(|a, b| (&a.file, &a.symbol).cmp(&(&b.file, &b.symbol)));
+    entrypoints.dedup_by(|a, b| a.file == b.file && a.symbol == b.symbol);
+    entrypoints
+}
+
+/// Detect all entrypoints from IR files (declarative query engine / IR path).
+///
+/// Converts IR files to ParsedFile and delegates to the existing detection logic.
+/// The entrypoint detection heuristics operate on the same fields available in both
+/// representations, so results are identical.
+pub fn detect_entrypoints_ir(files: &[IrFile]) -> Vec<Entrypoint> {
+    let parsed: Vec<ParsedFile> = files.iter().map(|f| f.to_parsed_file()).collect();
+    detect_entrypoints(&parsed)
+}
+
+fn detect_file_entrypoints(file: &ParsedFile, out: &mut Vec<Entrypoint>) {
+    detect_test_file(file, out);
+    detect_http_routes(file, out);
+    detect_path_based_http_routes(file, out);
+    detect_cli_commands(file, out);
+    detect_path_based_cli_commands(file, out);
+    detect_queue_consumers(file, out);
+    detect_cron_jobs(file, out);
+    detect_react_pages(file, out);
+    detect_event_handlers(file, out);
+    detect_effect_ts(file, out);
+    detect_rust_modules(file, out);
+}
+
+// ---------------------------------------------------------------------------
+// Test file detection
+// ---------------------------------------------------------------------------
+
+fn detect_test_file(file: &ParsedFile, out: &mut Vec<Entrypoint>) {
+    if is_test_path(&file.path) {
+        // Find test functions/describes as symbols, or use the file itself
+        let test_symbols: Vec<&str> = file
+            .definitions
+            .iter()
+            .filter(|d| is_test_symbol_name(&d.name))
+            .map(|d| d.name.as_str())
+            .collect();
+
+        if test_symbols.is_empty() {
+            out.push(Entrypoint {
+                file: file.path.clone(),
+                symbol: file_stem(&file.path),
+                entrypoint_type: EntrypointType::TestFile,
+            });
+        } else {
+            for sym in test_symbols {
+                out.push(Entrypoint {
+                    file: file.path.clone(),
+                    symbol: sym.to_string(),
+                    entrypoint_type: EntrypointType::TestFile,
+                });
+            }
+        }
+    }
+}
+
+fn is_test_path(path: &str) -> bool {
+    let lower = path.to_lowercase();
+    // File name patterns
+    lower.contains(".test.") || lower.contains(".spec.") || lower.contains("_test.")
+        || lower.ends_with("_test.py")
+        || lower.ends_with("_test.ts")
+        || lower.ends_with("_test.js")
+        // Directory patterns
+        || lower.contains("__tests__/")
+        || lower.contains("/tests/")
+        || lower.contains("/test/")
+        || lower.starts_with("tests/")
+        || lower.starts_with("test/")
+        // Python test convention
+        || path.split('/').last().map_or(false, |f| f.starts_with("test_"))
+        // Go test files
+        || lower.ends_with("_test.go")
+        // Rust test files
+        || lower.ends_with("_test.rs")
+        || lower.ends_with("_tests.rs")
+        // Java test files
+        || (lower.ends_with(".java") && (
+            path.split('/').last().map_or(false, |f| f.ends_with("Test.java") || f.ends_with("Tests.java") || f.starts_with("Test"))
+        ))
+        // C# test files
+        || (lower.ends_with(".cs") && (
+            path.split('/').last().map_or(false, |f| f.ends_with("Tests.cs") || f.ends_with("Test.cs"))
+        ))
+        // PHP test files
+        || (lower.ends_with(".php") && (
+            path.split('/').last().map_or(false, |f| f.ends_with("Test.php") || f.ends_with("Tests.php") || f.starts_with("test_"))
+        ))
+        // Ruby test files: RSpec spec/*_spec.rb, Minitest test/*_test.rb
+        || (lower.ends_with(".rb") && (
+            path.split('/').last().map_or(false, |f| f.ends_with("_spec.rb") || f.ends_with("_test.rb") || f.starts_with("test_"))
+            || lower.contains("/spec/")
+        ))
+        // Kotlin test files: JUnit *Test.kt, KotlinTest *Test.kt
+        || (lower.ends_with(".kt") && (
+            path.split('/').last().map_or(false, |f| f.ends_with("Test.kt") || f.ends_with("Tests.kt") || f.starts_with("Test"))
+        ))
+        // Swift test files: XCTest *Tests.swift, *Test.swift
+        || (lower.ends_with(".swift") && (
+            path.split('/').last().map_or(false, |f| f.ends_with("Tests.swift") || f.ends_with("Test.swift"))
+            || lower.contains("/tests/")
+        ))
+        // C test files: *_test.c, test_*.c, or in test/ directory
+        || ((lower.ends_with(".c") || lower.ends_with(".h")) && (
+            path.split('/').last().map_or(false, |f| f.ends_with("_test.c") || f.ends_with("_tests.c") || f.starts_with("test_"))
+            || lower.contains("/tests/") || lower.contains("/test/")
+        ))
+        // C++ test files: *_test.cpp, *Test.cpp, test_*.cpp, or in test/ directory
+        || ((lower.ends_with(".cpp") || lower.ends_with(".cc") || lower.ends_with(".cxx")) && (
+            path.split('/').last().map_or(false, |f| {
+                f.ends_with("_test.cpp") || f.ends_with("_test.cc") || f.ends_with("_test.cxx")
+                || f.ends_with("_tests.cpp") || f.ends_with("_tests.cc")
+                || f.ends_with("Test.cpp") || f.ends_with("Test.cc")
+                || f.starts_with("test_")
+            })
+            || lower.contains("/tests/") || lower.contains("/test/")
+        ))
+        // Scala test files: *Test.scala, *Spec.scala, *Suite.scala, or in test/ directory
+        || (lower.ends_with(".scala") && (
+            path.split('/').last().map_or(false, |f| {
+                f.ends_with("Test.scala") || f.ends_with("Tests.scala")
+                || f.ends_with("Spec.scala") || f.ends_with("Suite.scala")
+                || f.starts_with("Test")
+            })
+            || lower.contains("/test/") || lower.contains("/tests/")
+        ))
+}
+
+fn is_test_symbol_name(name: &str) -> bool {
+    name.starts_with("test_")
+        || name.starts_with("it_")
+        || name == "describe"
+        || name == "it"
+        || name == "test"
+        // Go test conventions: Test*, Benchmark*, Example*
+        || name.starts_with("Test")
+        || name.starts_with("Benchmark")
+        || name.starts_with("Example")
+        // C/C++ test frameworks: Google Test TEST/TEST_F, Catch2 TEST_CASE
+        || name == "TEST"
+        || name == "TEST_F"
+        || name == "TEST_P"
+        || name == "TEST_CASE"
+        || name == "SCENARIO"
+}
+
+// ---------------------------------------------------------------------------
+// HTTP route detection
+// ---------------------------------------------------------------------------
+
+fn detect_http_routes(file: &ParsedFile, out: &mut Vec<Entrypoint>) {
+    match file.language {
+        Language::TypeScript | Language::JavaScript => detect_http_routes_js(file, out),
+        Language::Python => detect_http_routes_python(file, out),
+        Language::Go => detect_http_routes_go(file, out),
+        Language::Rust => detect_http_routes_rust(file, out),
+        Language::Java => detect_http_routes_java(file, out),
+        Language::CSharp => detect_http_routes_csharp(file, out),
+        Language::Php => detect_http_routes_php(file, out),
+        Language::Ruby => detect_http_routes_ruby(file, out),
+        Language::Kotlin => detect_http_routes_kotlin(file, out),
+        Language::Swift => detect_http_routes_swift(file, out),
+        Language::C => detect_http_routes_c_cpp(file, out),
+        Language::Cpp => detect_http_routes_c_cpp(file, out),
+        Language::Scala => detect_http_routes_scala(file, out),
+        Language::Unknown => {}
+    }
+}
+
+/// Detect Express/Fastify-style route registrations: app.get(), router.post(), etc.
+/// Also detect Next.js/file-based routing patterns.
+fn detect_http_routes_js(file: &ParsedFile, out: &mut Vec<Entrypoint>) {
+    let http_methods = [
+        "get", "post", "put", "delete", "patch", "options", "head", "all",
+    ];
+    let router_objects = ["app", "router", "server"];
+
+    // Check for Next.js App Router conventions (route.ts exporting HTTP methods)
+    if is_nextjs_route_file(&file.path) {
+        for export in &file.exports {
+            let upper = export.name.to_uppercase();
+            if http_methods.contains(&upper.to_lowercase().as_str())
+                || upper == "GET"
+                || upper == "POST"
+                || upper == "PUT"
+                || upper == "DELETE"
+                || upper == "PATCH"
+                || upper == "OPTIONS"
+                || upper == "HEAD"
+            {
+                out.push(Entrypoint {
+                    file: file.path.clone(),
+                    symbol: export.name.clone(),
+                    entrypoint_type: EntrypointType::HttpRoute,
+                });
+            }
+        }
+    }
+
+    // Check for Next.js Pages Router conventions (default export from pages/)
+    if is_nextjs_pages_file(&file.path) {
+        for export in &file.exports {
+            if export.is_default {
+                out.push(Entrypoint {
+                    file: file.path.clone(),
+                    symbol: export.name.clone(),
+                    entrypoint_type: EntrypointType::HttpRoute,
+                });
+                break;
+            }
+        }
+    }
+
+    // Check call sites for router.get/post/... patterns
+    for call in &file.call_sites {
+        if let Some((obj, method)) = call.callee.split_once('.') {
+            if router_objects.contains(&obj) && http_methods.contains(&method) {
+                let symbol = call
+                    .containing_function
+                    .clone()
+                    .unwrap_or_else(|| call.callee.clone());
+                out.push(Entrypoint {
+                    file: file.path.clone(),
+                    symbol,
+                    entrypoint_type: EntrypointType::HttpRoute,
+                });
+            }
+        }
+    }
+}
+
+fn is_nextjs_route_file(path: &str) -> bool {
+    let lower = path.to_lowercase();
+    // Next.js App Router: app/**/route.ts
+    (lower.contains("/app/") || lower.starts_with("app/"))
+        && path
+            .split('/')
+            .last()
+            .map_or(false, |f| f.starts_with("route."))
+}
+
+fn is_nextjs_pages_file(path: &str) -> bool {
+    let lower = path.to_lowercase();
+    // Next.js Pages Router: pages/**/*.tsx (excluding _app, _document, _error, api/)
+    let in_pages = lower.contains("/pages/") || lower.starts_with("pages/");
+    if !in_pages {
+        return false;
+    }
+    let filename = path.split('/').last().unwrap_or("");
+    !filename.starts_with('_') && !lower.contains("/api/")
+}
+
+/// Detect Flask/FastAPI/Django route decorators in Python.
+fn detect_http_routes_python(file: &ParsedFile, out: &mut Vec<Entrypoint>) {
+    let route_decorators = [
+        "app.route",
+        "app.get",
+        "app.post",
+        "app.put",
+        "app.delete",
+        "app.patch",
+        "router.route",
+        "router.get",
+        "router.post",
+        "router.put",
+        "router.delete",
+        "router.patch",
+        "api_view",
+    ];
+
+    // Check call sites for decorator-style route registrations
+    for call in &file.call_sites {
+        if route_decorators.iter().any(|d| call.callee == *d) {
+            if let Some(ref func) = call.containing_function {
+                out.push(Entrypoint {
+                    file: file.path.clone(),
+                    symbol: func.clone(),
+                    entrypoint_type: EntrypointType::HttpRoute,
+                });
+            }
+        }
+    }
+
+    // Also check if file path suggests it's a views/routes module
+    let is_route_module = file.path.contains("/views/")
+        || file.path.contains("/routes/")
+        || file.path.contains("/endpoints/")
+        || file.path.ends_with("views.py")
+        || file.path.ends_with("routes.py")
+        || file.path.ends_with("endpoints.py");
+
+    if is_route_module {
+        // Functions in route modules that import from web frameworks are likely handlers
+        let has_web_framework_import = file.imports.iter().any(|i| is_web_framework_import(i));
+        if has_web_framework_import {
+            for def in &file.definitions {
+                if def.kind == crate::types::SymbolKind::Function
+                    && !def.name.starts_with('_')
+                    && def.name != "__init__"
+                {
+                    out.push(Entrypoint {
+                        file: file.path.clone(),
+                        symbol: def.name.clone(),
+                        entrypoint_type: EntrypointType::HttpRoute,
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// Detect Go HTTP route handlers: net/http, gin, echo, chi, fiber patterns.
+fn detect_http_routes_go(file: &ParsedFile, out: &mut Vec<Entrypoint>) {
+    let http_methods = [
+        "get", "post", "put", "delete", "patch", "options", "head", "any", "group",
+    ];
+
+    // Check if we have a Go web framework import
+    let has_http_import = file.imports.iter().any(|i| {
+        i.source == "net/http"
+            || i.source == "github.com/gin-gonic/gin"
+            || i.source.starts_with("github.com/labstack/echo")
+            || i.source.starts_with("github.com/go-chi/chi")
+            || i.source.starts_with("github.com/gofiber/fiber")
+            || i.source.starts_with("github.com/gorilla/mux")
+    });
+
+    if !has_http_import {
+        return;
+    }
+
+    // Check for handler function patterns
+    for call in &file.call_sites {
+        let callee = &call.callee;
+
+        // Standard library: http.HandleFunc, http.Handle
+        if callee == "http.HandleFunc" || callee == "http.Handle" || callee == "http.ListenAndServe"
+        {
+            let symbol = call
+                .containing_function
+                .clone()
+                .unwrap_or_else(|| call.callee.clone());
+            out.push(Entrypoint {
+                file: file.path.clone(),
+                symbol,
+                entrypoint_type: EntrypointType::HttpRoute,
+            });
+            continue;
+        }
+
+        // Framework patterns: router.GET, r.Post, c.Get, app.Get, e.GET, etc.
+        if let Some((_, method)) = callee.rsplit_once('.') {
+            let method_lower = method.to_lowercase();
+            if http_methods.contains(&method_lower.as_str())
+                || method == "HandleFunc"
+                || method == "Handle"
+            {
+                let symbol = call
+                    .containing_function
+                    .clone()
+                    .unwrap_or_else(|| call.callee.clone());
+                out.push(Entrypoint {
+                    file: file.path.clone(),
+                    symbol,
+                    entrypoint_type: EntrypointType::HttpRoute,
+                });
+            }
+        }
+    }
+
+    // Detect handler-like functions by convention
+    let is_handler_module = file.path.contains("/handler")
+        || file.path.contains("/handlers/")
+        || file.path.contains("/routes/")
+        || file.path.contains("/api/");
+
+    if is_handler_module {
+        for def in &file.definitions {
+            if def.kind == crate::types::SymbolKind::Function
+                && def.name.chars().next().map_or(false, |c| c.is_uppercase())
+                && (def.name.contains("Handler")
+                    || def.name.ends_with("Handle")
+                    || def.name.starts_with("Handle"))
+            {
+                out.push(Entrypoint {
+                    file: file.path.clone(),
+                    symbol: def.name.clone(),
+                    entrypoint_type: EntrypointType::HttpRoute,
+                });
+            }
+        }
+    }
+}
+
+fn detect_http_routes_rust(file: &ParsedFile, out: &mut Vec<Entrypoint>) {
+    // Check if we have a Rust web framework import
+    let has_http_import = file.imports.iter().any(|i| {
+        i.source.starts_with("actix_web")
+            || i.source.starts_with("actix-web")
+            || i.source.starts_with("axum")
+            || i.source.starts_with("rocket")
+            || i.source.starts_with("warp")
+            || i.source.starts_with("hyper")
+            || i.source.starts_with("tower")
+    });
+
+    if !has_http_import {
+        return;
+    }
+
+    // Check for actix-web attribute-style route handlers: #[get("/")], #[post("/")]
+    // These are detected by looking for functions in handler-like modules
+    // and for call patterns like Router::new().route()
+    for call in &file.call_sites {
+        let callee = &call.callee;
+
+        // Axum: Router::new, .route(), get(), post(), etc.
+        if callee.contains("Router::new")
+            || callee.contains(".route")
+            || callee.contains("axum::routing::get")
+            || callee.contains("axum::routing::post")
+            || callee.contains("axum::routing::put")
+            || callee.contains("axum::routing::delete")
+            || callee.contains("routing::get")
+            || callee.contains("routing::post")
+            || callee.contains("routing::put")
+            || callee.contains("routing::delete")
+            || callee == "get"
+            || callee == "post"
+            || callee == "put"
+            || callee == "delete"
+        {
+            let symbol = call
+                .containing_function
+                .clone()
+                .unwrap_or_else(|| call.callee.clone());
+            out.push(Entrypoint {
+                file: file.path.clone(),
+                symbol,
+                entrypoint_type: EntrypointType::HttpRoute,
+            });
+        }
+
+        // Actix-web: web::resource, web::scope, App::new().service()
+        if callee.contains("web::resource")
+            || callee.contains("web::scope")
+            || callee.contains("App::new")
+            || callee.contains(".service")
+            || callee.contains("HttpServer::new")
+        {
+            let symbol = call
+                .containing_function
+                .clone()
+                .unwrap_or_else(|| call.callee.clone());
+            out.push(Entrypoint {
+                file: file.path.clone(),
+                symbol,
+                entrypoint_type: EntrypointType::HttpRoute,
+            });
+        }
+
+        // Rocket: routes!, mount()
+        if callee.contains("routes!")
+            || callee.contains(".mount")
+            || callee.contains("rocket::build")
+        {
+            let symbol = call
+                .containing_function
+                .clone()
+                .unwrap_or_else(|| call.callee.clone());
+            out.push(Entrypoint {
+                file: file.path.clone(),
+                symbol,
+                entrypoint_type: EntrypointType::HttpRoute,
+            });
+        }
+    }
+
+    // Detect handler-like functions by path convention
+    let is_handler_module = file.path.contains("/handler")
+        || file.path.contains("/handlers/")
+        || file.path.contains("/routes/")
+        || file.path.contains("/api/");
+
+    if is_handler_module {
+        for def in &file.definitions {
+            if def.kind == crate::types::SymbolKind::Function {
+                out.push(Entrypoint {
+                    file: file.path.clone(),
+                    symbol: def.name.clone(),
+                    entrypoint_type: EntrypointType::HttpRoute,
+                });
+            }
+        }
+    }
+}
+
+/// Detect Java HTTP route handlers: Spring Boot, JAX-RS, Servlet patterns.
+fn detect_http_routes_java(file: &ParsedFile, out: &mut Vec<Entrypoint>) {
+    // Check if we have a Java web framework import
+    let has_spring_import = file.imports.iter().any(|i| {
+        i.source.starts_with("org.springframework.web")
+            || i.source.starts_with("org.springframework.boot")
+            || i.source.starts_with("org.springframework.stereotype")
+    });
+
+    let has_jaxrs_import = file
+        .imports
+        .iter()
+        .any(|i| i.source.starts_with("jakarta.ws.rs") || i.source.starts_with("javax.ws.rs"));
+
+    let has_servlet_import = file
+        .imports
+        .iter()
+        .any(|i| i.source.starts_with("jakarta.servlet") || i.source.starts_with("javax.servlet"));
+
+    if !has_spring_import && !has_jaxrs_import && !has_servlet_import {
+        return;
+    }
+
+    // Spring Boot: look for @GetMapping, @PostMapping, @RequestMapping, etc. in import names
+    if has_spring_import {
+        let has_mapping_annotation = file.imports.iter().any(|i| {
+            i.names.iter().any(|n| {
+                n.name.ends_with("Mapping")
+                    || n.name == "RestController"
+                    || n.name == "Controller"
+                    || n.name == "RequestMapping"
+            })
+        });
+
+        if has_mapping_annotation {
+            // All public methods in a controller are potential endpoints
+            for def in &file.definitions {
+                if def.kind == crate::types::SymbolKind::Function && def.name != "<init>" {
+                    out.push(Entrypoint {
+                        file: file.path.clone(),
+                        symbol: def.name.clone(),
+                        entrypoint_type: EntrypointType::HttpRoute,
+                    });
+                }
+            }
+        }
+    }
+
+    // JAX-RS: @GET, @POST, @Path
+    if has_jaxrs_import {
+        let has_path_annotation = file.imports.iter().any(|i| {
+            i.names.iter().any(|n| {
+                n.name == "Path"
+                    || n.name == "GET"
+                    || n.name == "POST"
+                    || n.name == "PUT"
+                    || n.name == "DELETE"
+            })
+        });
+
+        if has_path_annotation {
+            for def in &file.definitions {
+                if def.kind == crate::types::SymbolKind::Function {
+                    out.push(Entrypoint {
+                        file: file.path.clone(),
+                        symbol: def.name.clone(),
+                        entrypoint_type: EntrypointType::HttpRoute,
+                    });
+                }
+            }
+        }
+    }
+
+    // Servlet: doGet, doPost, etc.
+    if has_servlet_import {
+        for def in &file.definitions {
+            if def.kind == crate::types::SymbolKind::Function
+                && (def.name.starts_with("do")
+                    && [
+                        "doGet",
+                        "doPost",
+                        "doPut",
+                        "doDelete",
+                        "doHead",
+                        "doOptions",
+                    ]
+                    .contains(&def.name.as_str()))
+            {
+                out.push(Entrypoint {
+                    file: file.path.clone(),
+                    symbol: def.name.clone(),
+                    entrypoint_type: EntrypointType::HttpRoute,
+                });
+            }
+        }
+    }
+
+    // Detect handler-like files by path convention
+    let is_controller_module = file.path.contains("/controller")
+        || file.path.contains("/controllers/")
+        || file.path.contains("/resource/")
+        || file.path.contains("/resources/")
+        || file.path.contains("/endpoint/")
+        || file.path.contains("/endpoints/")
+        || file.path.contains("/api/");
+
+    if is_controller_module && !has_spring_import && !has_jaxrs_import {
+        for def in &file.definitions {
+            if def.kind == crate::types::SymbolKind::Function {
+                out.push(Entrypoint {
+                    file: file.path.clone(),
+                    symbol: def.name.clone(),
+                    entrypoint_type: EntrypointType::HttpRoute,
+                });
+            }
+        }
+    }
+}
+
+/// Detect C# HTTP route handlers: ASP.NET Core controllers, minimal API patterns.
+fn detect_http_routes_csharp(file: &ParsedFile, out: &mut Vec<Entrypoint>) {
+    // Check for ASP.NET Core web framework imports
+    let has_aspnet_import = file.imports.iter().any(|i| {
+        i.source.starts_with("Microsoft.AspNetCore")
+            || i.source.starts_with("Microsoft.AspNet")
+            || i.source == "System.Web"
+            || i.source.starts_with("System.Web")
+    });
+
+    if !has_aspnet_import {
+        // Also check path-based heuristic for controller files
+        let is_controller_file = file.path.contains("/Controllers/")
+            || file.path.contains("/controllers/")
+            || file.path.contains("/Endpoints/")
+            || file.path.contains("/endpoints/")
+            || file.path.contains("/Api/")
+            || file.path.contains("/api/")
+            || file
+                .path
+                .split('/')
+                .last()
+                .map_or(false, |f| f.ends_with("Controller.cs"));
+
+        if is_controller_file {
+            for def in &file.definitions {
+                if def.kind == crate::types::SymbolKind::Function {
+                    out.push(Entrypoint {
+                        file: file.path.clone(),
+                        symbol: def.name.clone(),
+                        entrypoint_type: EntrypointType::HttpRoute,
+                    });
+                }
+            }
+        }
+        return;
+    }
+
+    // ASP.NET Core: controller classes with action methods
+    // C# using directives import entire namespaces, so check source directly
+    let has_controller_import = file.imports.iter().any(|i| {
+        i.source.starts_with("Microsoft.AspNetCore.Mvc")
+            || i.source.starts_with("Microsoft.AspNetCore.Http")
+            || i.source.starts_with("Microsoft.AspNetCore.Routing")
+    });
+
+    if has_controller_import {
+        for def in &file.definitions {
+            if def.kind == crate::types::SymbolKind::Function
+                && def.name
+                    != file
+                        .path
+                        .split('/')
+                        .last()
+                        .unwrap_or("")
+                        .trim_end_matches(".cs")
+            {
+                out.push(Entrypoint {
+                    file: file.path.clone(),
+                    symbol: def.name.clone(),
+                    entrypoint_type: EntrypointType::HttpRoute,
+                });
+            }
+        }
+    }
+
+    // Minimal API: app.MapGet, app.MapPost, etc.
+    let map_methods = ["MapGet", "MapPost", "MapPut", "MapDelete", "MapPatch"];
+    for call in &file.call_sites {
+        if map_methods
+            .iter()
+            .any(|m| call.callee == *m || call.callee.ends_with(&format!(".{m}")))
+        {
+            let symbol = call
+                .containing_function
+                .clone()
+                .unwrap_or_else(|| call.callee.clone());
+            out.push(Entrypoint {
+                file: file.path.clone(),
+                symbol,
+                entrypoint_type: EntrypointType::HttpRoute,
+            });
+        }
+    }
+}
+
+/// Detect PHP HTTP route handlers: Laravel controllers, Symfony controllers, route files.
+fn detect_http_routes_php(file: &ParsedFile, out: &mut Vec<Entrypoint>) {
+    // Check for PHP web framework imports
+    let has_laravel_import = file
+        .imports
+        .iter()
+        .any(|i| i.source.starts_with("Illuminate\\") || i.source.starts_with("Laravel\\"));
+
+    let has_symfony_import = file
+        .imports
+        .iter()
+        .any(|i| i.source.starts_with("Symfony\\"));
+
+    if !has_laravel_import && !has_symfony_import {
+        // Path-based heuristic for controller files
+        let is_controller_file = file.path.contains("/Controllers/")
+            || file.path.contains("/controllers/")
+            || file.path.contains("/routes/")
+            || file.path.contains("/Routes/")
+            || file.path.contains("/api/")
+            || file.path.contains("/Api/")
+            || file
+                .path
+                .split('/')
+                .last()
+                .map_or(false, |f| f.ends_with("Controller.php"));
+
+        if is_controller_file {
+            for def in &file.definitions {
+                if def.kind == crate::types::SymbolKind::Function
+                    && !def.name.starts_with('_')
+                    && def.name != "__construct"
+                {
+                    out.push(Entrypoint {
+                        file: file.path.clone(),
+                        symbol: def.name.clone(),
+                        entrypoint_type: EntrypointType::HttpRoute,
+                    });
+                }
+            }
+        }
+        return;
+    }
+
+    // Laravel: controller action methods (public methods excluding __construct)
+    if has_laravel_import {
+        for def in &file.definitions {
+            if def.kind == crate::types::SymbolKind::Function
+                && !def.name.starts_with('_')
+                && def.name != "__construct"
+            {
+                out.push(Entrypoint {
+                    file: file.path.clone(),
+                    symbol: def.name.clone(),
+                    entrypoint_type: EntrypointType::HttpRoute,
+                });
+            }
+        }
+    }
+
+    // Symfony: controller action methods
+    if has_symfony_import {
+        for def in &file.definitions {
+            if def.kind == crate::types::SymbolKind::Function
+                && !def.name.starts_with('_')
+                && def.name != "__construct"
+            {
+                out.push(Entrypoint {
+                    file: file.path.clone(),
+                    symbol: def.name.clone(),
+                    entrypoint_type: EntrypointType::HttpRoute,
+                });
+            }
+        }
+    }
+}
+
+fn detect_http_routes_ruby(file: &ParsedFile, out: &mut Vec<Entrypoint>) {
+    // Check for Ruby web framework imports
+    let has_rails_import = file.imports.iter().any(|i| {
+        i.source == "action_controller" || i.source == "rails" || i.source == "active_record"
+    });
+
+    let has_sinatra_import = file
+        .imports
+        .iter()
+        .any(|i| i.source == "sinatra" || i.source == "sinatra/base");
+
+    let has_grape_import = file.imports.iter().any(|i| i.source == "grape");
+
+    // Sinatra-style: detect get/post/put/delete/patch route DSL calls
+    if has_sinatra_import || has_grape_import {
+        let http_methods = ["get", "post", "put", "delete", "patch", "options", "head"];
+        for call in &file.call_sites {
+            if http_methods.contains(&call.callee.as_str()) {
+                out.push(Entrypoint {
+                    file: file.path.clone(),
+                    symbol: call.callee.clone(),
+                    entrypoint_type: EntrypointType::HttpRoute,
+                });
+            }
+        }
+        return;
+    }
+
+    // Rails: controller action methods
+    if has_rails_import {
+        for def in &file.definitions {
+            if def.kind == crate::types::SymbolKind::Function
+                && !def.name.starts_with('_')
+                && def.name != "initialize"
+            {
+                out.push(Entrypoint {
+                    file: file.path.clone(),
+                    symbol: def.name.clone(),
+                    entrypoint_type: EntrypointType::HttpRoute,
+                });
+            }
+        }
+        return;
+    }
+
+    // Path-based heuristic for Rails controller files
+    let is_controller_file = file.path.contains("/controllers/")
+        || file.path.contains("/Controllers/")
+        || file.path.contains("/routes/")
+        || file
+            .path
+            .split('/')
+            .last()
+            .map_or(false, |f| f.ends_with("_controller.rb"));
+
+    if is_controller_file {
+        for def in &file.definitions {
+            if def.kind == crate::types::SymbolKind::Function
+                && !def.name.starts_with('_')
+                && def.name != "initialize"
+            {
+                out.push(Entrypoint {
+                    file: file.path.clone(),
+                    symbol: def.name.clone(),
+                    entrypoint_type: EntrypointType::HttpRoute,
+                });
+            }
+        }
+    }
+}
+
+fn detect_http_routes_kotlin(file: &ParsedFile, out: &mut Vec<Entrypoint>) {
+    // Check for Kotlin web framework imports
+    let has_ktor_import = file.imports.iter().any(|i| i.source.starts_with("io.ktor"));
+
+    let has_spring_import = file
+        .imports
+        .iter()
+        .any(|i| i.source.starts_with("org.springframework"));
+
+    // Ktor route DSL: get, post, put, delete, patch, route
+    if has_ktor_import {
+        let http_methods = [
+            "get", "post", "put", "delete", "patch", "head", "options", "route",
+        ];
+        for call in &file.call_sites {
+            if http_methods.contains(&call.callee.as_str()) {
+                out.push(Entrypoint {
+                    file: file.path.clone(),
+                    symbol: call.callee.clone(),
+                    entrypoint_type: EntrypointType::HttpRoute,
+                });
+            }
+        }
+        return;
+    }
+
+    // Spring Boot (Kotlin): controller methods with annotation-style imports
+    if has_spring_import {
+        for def in &file.definitions {
+            if def.kind == crate::types::SymbolKind::Function && !def.name.starts_with('_') {
+                out.push(Entrypoint {
+                    file: file.path.clone(),
+                    symbol: def.name.clone(),
+                    entrypoint_type: EntrypointType::HttpRoute,
+                });
+            }
+        }
+        return;
+    }
+
+    // Path-based heuristic for controller files
+    let is_controller_file = file.path.contains("/controllers/")
+        || file.path.contains("/controller/")
+        || file.path.contains("/routes/")
+        || file
+            .path
+            .split('/')
+            .last()
+            .map_or(false, |f| f.ends_with("Controller.kt"));
+
+    if is_controller_file {
+        for def in &file.definitions {
+            if def.kind == crate::types::SymbolKind::Function && !def.name.starts_with('_') {
+                out.push(Entrypoint {
+                    file: file.path.clone(),
+                    symbol: def.name.clone(),
+                    entrypoint_type: EntrypointType::HttpRoute,
+                });
+            }
+        }
+    }
+}
+
+fn detect_http_routes_swift(file: &ParsedFile, out: &mut Vec<Entrypoint>) {
+    // Check for Vapor framework imports
+    let has_vapor_import = file.imports.iter().any(|i| i.source == "Vapor");
+
+    if has_vapor_import {
+        // Vapor route DSL: get, post, put, delete, patch, route
+        let http_methods = [
+            "get", "post", "put", "delete", "patch", "head", "options", "route",
+        ];
+        for call in &file.call_sites {
+            if http_methods.contains(&call.callee.as_str()) {
+                out.push(Entrypoint {
+                    file: file.path.clone(),
+                    symbol: call.callee.clone(),
+                    entrypoint_type: EntrypointType::HttpRoute,
+                });
+            }
+        }
+        return;
+    }
+
+    // Path-based heuristic for controller files
+    let is_controller_file = file.path.contains("/Controllers/")
+        || file.path.contains("/controllers/")
+        || file.path.contains("/Routes/")
+        || file.path.contains("/routes/")
+        || file
+            .path
+            .split('/')
+            .last()
+            .map_or(false, |f| f.ends_with("Controller.swift"));
+
+    if is_controller_file {
+        for def in &file.definitions {
+            if def.kind == crate::types::SymbolKind::Function && !def.name.starts_with('_') {
+                out.push(Entrypoint {
+                    file: file.path.clone(),
+                    symbol: def.name.clone(),
+                    entrypoint_type: EntrypointType::HttpRoute,
+                });
+            }
+        }
+    }
+}
+
+fn detect_http_routes_c_cpp(file: &ParsedFile, out: &mut Vec<Entrypoint>) {
+    // Crow framework: CROW_ROUTE, app.route_dynamic
+    // cpp-httplib: svr.Get, svr.Post, etc.
+    // Pistache: Rest::Routes::Get, Rest::Routes::Post
+    // Drogon: app().registerHandler
+    let http_methods = ["Get", "Post", "Put", "Delete", "Patch", "Head", "Options"];
+
+    // Check for C++ HTTP framework imports
+    let has_http_framework = file.imports.iter().any(|i| {
+        i.source.contains("crow")
+            || i.source.contains("httplib")
+            || i.source.contains("pistache")
+            || i.source.contains("drogon")
+            || i.source.contains("cpprest")
+            || i.source.contains("beast")
+            || i.source.contains("mongoose")
+    });
+
+    if has_http_framework {
+        for call in &file.call_sites {
+            let callee_lower = call.callee.to_lowercase();
+            if http_methods
+                .iter()
+                .any(|m| callee_lower == m.to_lowercase())
+                || callee_lower.contains("route")
+                || callee_lower.contains("handler")
+                || callee_lower == "crow_route"
+            {
+                out.push(Entrypoint {
+                    file: file.path.clone(),
+                    symbol: call.callee.clone(),
+                    entrypoint_type: EntrypointType::HttpRoute,
+                });
+            }
+        }
+        return;
+    }
+
+    // Path-based heuristic for handler/controller files
+    let is_handler_file = file.path.contains("/handlers/")
+        || file.path.contains("/controllers/")
+        || file.path.contains("/routes/")
+        || file.path.contains("/endpoints/");
+
+    if is_handler_file {
+        for def in &file.definitions {
+            if def.kind == crate::types::SymbolKind::Function && !def.name.starts_with('_') {
+                out.push(Entrypoint {
+                    file: file.path.clone(),
+                    symbol: def.name.clone(),
+                    entrypoint_type: EntrypointType::HttpRoute,
+                });
+            }
+        }
+    }
+}
+
+fn detect_http_routes_scala(file: &ParsedFile, out: &mut Vec<Entrypoint>) {
+    // Check for Scala web framework imports
+    let has_akka_http = file
+        .imports
+        .iter()
+        .any(|i| i.source.starts_with("akka.http"));
+
+    let has_play_import = file
+        .imports
+        .iter()
+        .any(|i| i.source.starts_with("play.api.mvc") || i.source.starts_with("play.mvc"));
+
+    let has_http4s_import = file
+        .imports
+        .iter()
+        .any(|i| i.source.starts_with("org.http4s"));
+
+    // Akka HTTP route DSL: get, post, put, delete, patch, path, pathPrefix, complete
+    if has_akka_http {
+        let http_methods = [
+            "get",
+            "post",
+            "put",
+            "delete",
+            "patch",
+            "head",
+            "options",
+            "path",
+            "pathPrefix",
+            "complete",
+        ];
+        for call in &file.call_sites {
+            if http_methods.contains(&call.callee.as_str()) {
+                out.push(Entrypoint {
+                    file: file.path.clone(),
+                    symbol: call.callee.clone(),
+                    entrypoint_type: EntrypointType::HttpRoute,
+                });
+            }
+        }
+        return;
+    }
+
+    // Play Framework controller actions
+    if has_play_import {
+        for def in &file.definitions {
+            if def.kind == crate::types::SymbolKind::Function && !def.name.starts_with('_') {
+                out.push(Entrypoint {
+                    file: file.path.clone(),
+                    symbol: def.name.clone(),
+                    entrypoint_type: EntrypointType::HttpRoute,
+                });
+            }
+        }
+        return;
+    }
+
+    // http4s route DSL
+    if has_http4s_import {
+        let http_methods = ["get", "post", "put", "delete", "patch"];
+        for call in &file.call_sites {
+            let callee_lower = call.callee.to_lowercase();
+            if http_methods.contains(&callee_lower.as_str()) {
+                out.push(Entrypoint {
+                    file: file.path.clone(),
+                    symbol: call.callee.clone(),
+                    entrypoint_type: EntrypointType::HttpRoute,
+                });
+            }
+        }
+        return;
+    }
+
+    // Path-based heuristic for controller files
+    let is_controller_file = file.path.contains("/controllers/")
+        || file.path.contains("/controller/")
+        || file.path.contains("/routes/")
+        || file
+            .path
+            .split('/')
+            .last()
+            .map_or(false, |f| f.ends_with("Controller.scala"));
+
+    if is_controller_file {
+        for def in &file.definitions {
+            if def.kind == crate::types::SymbolKind::Function && !def.name.starts_with('_') {
+                out.push(Entrypoint {
+                    file: file.path.clone(),
+                    symbol: def.name.clone(),
+                    entrypoint_type: EntrypointType::HttpRoute,
+                });
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared path-based entrypoint detection helpers (all languages)
+// ---------------------------------------------------------------------------
+
+/// Tier 1: Path suggests route/handler AND needs framework import confirmation.
+fn is_route_handler_path(path: &str) -> bool {
+    let lower = path.to_lowercase();
+    // Directory patterns
+    lower.contains("/routes/")
+        || lower.contains("/route/")
+        || lower.contains("/handlers/")
+        || lower.contains("/handler/")
+        || lower.contains("/controllers/")
+        || lower.contains("/controller/")
+        || lower.contains("/endpoints/")
+        || lower.contains("/endpoint/")
+        // File name patterns
+        || has_filename_pattern(&lower, "routes")
+        || has_filename_pattern(&lower, "route")
+        || has_filename_pattern(&lower, "handler")
+        || has_filename_pattern(&lower, "handlers")
+        || has_filename_pattern(&lower, "controller")
+        || has_filename_pattern(&lower, "controllers")
+        || has_filename_pattern(&lower, "endpoint")
+        || has_filename_pattern(&lower, "endpoints")
+}
+
+/// Tier 2: Very strong path signal — no import check needed.
+fn is_strong_route_handler_path(path: &str) -> bool {
+    let lower = path.to_lowercase();
+    // Strong directory patterns (not just /api/ — too generic)
+    lower.contains("/routes/")
+        || lower.contains("/handlers/")
+        || lower.contains("/controllers/")
+        || lower.contains("/endpoints/")
+        // File name patterns with strong signal
+        || has_filename_pattern(&lower, "controller")
+        || has_filename_pattern(&lower, "controllers")
+        // Files with "entrypoint" in name
+        || lower.contains("entrypoint")
+}
+
+/// Check if a file path contains a `.{pattern}.` segment in its filename.
+/// e.g., `has_filename_pattern("src/billing.controller.ts", "controller")` → true
+fn has_filename_pattern(lower_path: &str, pattern: &str) -> bool {
+    if let Some(filename) = lower_path.rsplit('/').next() {
+        let dot_pattern = format!(".{}.", pattern);
+        filename.contains(&dot_pattern)
+    } else {
+        false
+    }
+}
+
+/// Check if the path is in a CLI-related directory.
+fn is_cli_command_path(path: &str) -> bool {
+    let lower = path.to_lowercase();
+    lower.contains("/commands/")
+        || lower.contains("/command/")
+        || lower.contains("/cmd/")
+        || lower.contains("/cli/")
+        || has_filename_pattern(&lower, "command")
+        || has_filename_pattern(&lower, "commands")
+        || has_filename_pattern(&lower, "cli")
+}
+
+/// Check if a path is in a /views/ directory (Python/Ruby/PHP only).
+fn is_views_path(path: &str) -> bool {
+    let lower = path.to_lowercase();
+    lower.contains("/views/")
+}
+
+// ---------------------------------------------------------------------------
+// Per-language web framework import helpers
+// ---------------------------------------------------------------------------
+
+/// Python web framework imports.
+fn is_web_framework_import(imp: &ImportInfo) -> bool {
+    is_python_web_framework_import(imp)
+}
+
+fn is_python_web_framework_import(imp: &ImportInfo) -> bool {
+    let src = &imp.source;
+    src == "flask"
+        || src == "fastapi"
+        || src.starts_with("django.")
+        || src == "django"
+        || src == "starlette"
+        || src.starts_with("starlette.")
+        || src == "sanic"
+        || src == "aiohttp"
+        || src.starts_with("aiohttp.")
+        || src == "tornado"
+        || src.starts_with("tornado.")
+        || src == "bottle"
+        || src == "falcon"
+        || src == "pyramid"
+        || src.starts_with("pyramid.")
+}
+
+fn is_js_web_framework_import(imp: &ImportInfo) -> bool {
+    let src = &imp.source;
+    src == "express"
+        || src == "fastify"
+        || src == "@hapi/hapi"
+        || src == "koa"
+        || src == "@trpc/server"
+        || src == "hono"
+        || src == "@nestjs/common"
+        || src == "@nestjs/core"
+        || src == "next"
+        || src == "nuxt"
+        || src.starts_with("@remix-run/")
+        || src == "sveltekit"
+        || src == "restify"
+        || src == "polka"
+        || src == "@effect/platform"
+}
+
+fn is_go_web_framework_import(imp: &ImportInfo) -> bool {
+    let src = &imp.source;
+    src == "net/http"
+        || src == "github.com/gin-gonic/gin"
+        || src.starts_with("github.com/labstack/echo")
+        || src.starts_with("github.com/go-chi/chi")
+        || src.starts_with("github.com/gofiber/fiber")
+        || src.starts_with("github.com/gorilla/mux")
+}
+
+fn is_rust_web_framework_import(imp: &ImportInfo) -> bool {
+    let src = &imp.source;
+    src == "actix_web"
+        || src == "actix-web"
+        || src.starts_with("actix_web::")
+        || src.starts_with("actix-web::")
+        || src == "axum"
+        || src.starts_with("axum::")
+        || src == "rocket"
+        || src.starts_with("rocket::")
+        || src == "warp"
+        || src.starts_with("warp::")
+        || src == "hyper"
+        || src.starts_with("hyper::")
+        || src == "tower"
+        || src.starts_with("tower::")
+}
+
+fn is_java_web_framework_import(imp: &ImportInfo) -> bool {
+    let src = &imp.source;
+    src.starts_with("org.springframework.web")
+        || src.starts_with("javax.ws.rs")
+        || src.starts_with("jakarta.ws.rs")
+        || src.starts_with("io.javalin")
+        || src.starts_with("io.micronaut.http")
+        || src.starts_with("io.quarkus")
+}
+
+fn is_csharp_web_framework_import(imp: &ImportInfo) -> bool {
+    let src = &imp.source;
+    src.starts_with("Microsoft.AspNetCore")
+        || src.starts_with("System.Web.Http")
+        || src.starts_with("Carter")
+        || src.starts_with("ServiceStack")
+}
+
+fn is_php_web_framework_import(imp: &ImportInfo) -> bool {
+    let src = &imp.source;
+    src.starts_with("Illuminate\\Routing")
+        || src.starts_with("Symfony\\Component\\Routing")
+        || src.starts_with("Slim\\App")
+}
+
+fn is_ruby_web_framework_import(imp: &ImportInfo) -> bool {
+    let src = &imp.source;
+    src == "sinatra" || src == "rails" || src == "grape" || src == "hanami" || src == "roda"
+}
+
+fn is_kotlin_web_framework_import(imp: &ImportInfo) -> bool {
+    let src = &imp.source;
+    src.starts_with("org.springframework.web")
+        || src.starts_with("io.ktor")
+        || src.starts_with("io.javalin")
+        || src.starts_with("io.micronaut.http")
+}
+
+fn is_swift_web_framework_import(imp: &ImportInfo) -> bool {
+    let src = &imp.source;
+    src == "Vapor" || src == "Kitura" || src == "Hummingbird"
+}
+
+fn is_scala_web_framework_import(imp: &ImportInfo) -> bool {
+    let src = &imp.source;
+    src.starts_with("akka.http")
+        || src.starts_with("http4s")
+        || src.starts_with("play.api")
+        || src.starts_with("zio.http")
+        || src.starts_with("cask")
+}
+
+// ---------------------------------------------------------------------------
+// Per-language CLI framework import helpers
+// ---------------------------------------------------------------------------
+
+fn is_js_cli_framework_import(imp: &ImportInfo) -> bool {
+    let src = &imp.source;
+    src == "commander"
+        || src == "yargs"
+        || src == "meow"
+        || src == "cac"
+        || src == "oclif"
+        || src == "@effect/cli"
+        || src == "inquirer"
+        || src == "vorpal"
+        || src == "caporal"
+        || src == "clipanion"
+}
+
+fn is_python_cli_framework_import(imp: &ImportInfo) -> bool {
+    let src = &imp.source;
+    src == "argparse"
+        || src == "click"
+        || src == "typer"
+        || src == "fire"
+        || src == "docopt"
+        || src == "plac"
+}
+
+fn is_go_cli_framework_import(imp: &ImportInfo) -> bool {
+    let src = &imp.source;
+    src.starts_with("github.com/spf13/cobra")
+        || src.starts_with("github.com/urfave/cli")
+        || src == "flag"
+}
+
+fn is_rust_cli_framework_import(imp: &ImportInfo) -> bool {
+    let src = &imp.source;
+    src.starts_with("clap")
+        || src.starts_with("structopt")
+        || src.starts_with("argh")
+        || src.starts_with("gumdrop")
+}
+
+/// Get the appropriate web framework import checker for a given language.
+fn has_web_framework_import_for_lang(file: &ParsedFile) -> bool {
+    file.imports.iter().any(|imp| match file.language {
+        Language::TypeScript | Language::JavaScript => is_js_web_framework_import(imp),
+        Language::Python => is_python_web_framework_import(imp),
+        Language::Go => is_go_web_framework_import(imp),
+        Language::Rust => is_rust_web_framework_import(imp),
+        Language::Java => is_java_web_framework_import(imp),
+        Language::CSharp => is_csharp_web_framework_import(imp),
+        Language::Php => is_php_web_framework_import(imp),
+        Language::Ruby => is_ruby_web_framework_import(imp),
+        Language::Kotlin => is_kotlin_web_framework_import(imp),
+        Language::Swift => is_swift_web_framework_import(imp),
+        Language::Scala => is_scala_web_framework_import(imp),
+        Language::C | Language::Cpp | Language::Unknown => false,
+    })
+}
+
+/// Get the appropriate CLI framework import checker for a given language.
+fn has_cli_framework_import_for_lang(file: &ParsedFile) -> bool {
+    file.imports.iter().any(|imp| match file.language {
+        Language::TypeScript | Language::JavaScript => is_js_cli_framework_import(imp),
+        Language::Python => is_python_cli_framework_import(imp),
+        Language::Go => is_go_cli_framework_import(imp),
+        Language::Rust => is_rust_cli_framework_import(imp),
+        _ => false,
+    })
+}
+
+/// Add all exported/public functions as entrypoints (used by path-based detection).
+fn add_exported_functions_as_entrypoints(
+    file: &ParsedFile,
+    ep_type: EntrypointType,
+    out: &mut Vec<Entrypoint>,
+) {
+    for def in &file.definitions {
+        if def.kind == crate::types::SymbolKind::Function && !def.name.starts_with('_') {
+            out.push(Entrypoint {
+                file: file.path.clone(),
+                symbol: def.name.clone(),
+                entrypoint_type: ep_type.clone(),
+            });
+        }
+    }
+    // Also add exports as entrypoints for JS/TS
+    if matches!(file.language, Language::TypeScript | Language::JavaScript) {
+        for export in &file.exports {
+            out.push(Entrypoint {
+                file: file.path.clone(),
+                symbol: export.name.clone(),
+                entrypoint_type: ep_type.clone(),
+            });
+        }
+    }
+}
+
+/// Universal path-based HTTP route detection — applies after call-site detection.
+///
+/// Tier 1: path + framework import → all exported functions become entrypoints.
+/// Tier 2: strong path only → same, no import check.
+fn detect_path_based_http_routes(file: &ParsedFile, out: &mut Vec<Entrypoint>) {
+    let is_views = is_views_path(&file.path)
+        && matches!(
+            file.language,
+            Language::Python | Language::Ruby | Language::Php
+        );
+
+    if is_strong_route_handler_path(&file.path) {
+        add_exported_functions_as_entrypoints(file, EntrypointType::HttpRoute, out);
+    } else if (is_route_handler_path(&file.path) || is_views)
+        && has_web_framework_import_for_lang(file)
+    {
+        add_exported_functions_as_entrypoints(file, EntrypointType::HttpRoute, out);
+    }
+}
+
+/// Universal path-based CLI command detection — applies after call-site detection.
+fn detect_path_based_cli_commands(file: &ParsedFile, out: &mut Vec<Entrypoint>) {
+    if is_cli_command_path(&file.path) {
+        if has_cli_framework_import_for_lang(file) {
+            add_exported_functions_as_entrypoints(file, EntrypointType::CliCommand, out);
+        }
+        // Strong signal: /commands/ directory is strong enough without import check
+        let lower = file.path.to_lowercase();
+        if lower.contains("/commands/") || lower.contains("/command/") {
+            add_exported_functions_as_entrypoints(file, EntrypointType::CliCommand, out);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CLI command detection
+// ---------------------------------------------------------------------------
+
+fn detect_cli_commands(file: &ParsedFile, out: &mut Vec<Entrypoint>) {
+    // Detect main() functions
+    let has_main = file.definitions.iter().any(|d| d.name == "main");
+
+    if has_main {
+        // Python: if __name__ == '__main__' pattern (detected via main def + path convention)
+        // JS/TS: main() function in entry-like files
+        // Go: func main() is always a CLI entrypoint
+        let is_cli_path = is_cli_file_path(&file.path);
+        if is_cli_path
+            || file.language == Language::Python
+            || file.language == Language::Go
+            || file.language == Language::Rust
+            || file.language == Language::Java
+            || file.language == Language::CSharp
+            || file.language == Language::Php
+            || file.language == Language::Ruby
+            || file.language == Language::Kotlin
+            || file.language == Language::Swift
+            || file.language == Language::C
+            || file.language == Language::Cpp
+        {
+            out.push(Entrypoint {
+                file: file.path.clone(),
+                symbol: "main".to_string(),
+                entrypoint_type: EntrypointType::CliCommand,
+            });
+        }
+    }
+
+    // Check for argument parser imports (Python)
+    if file.language == Language::Python {
+        let has_argparse = file
+            .imports
+            .iter()
+            .any(|i| i.source == "argparse" || i.source == "click" || i.source == "typer");
+        if has_argparse {
+            // Functions decorated with @click.command or @app.command are CLI entrypoints
+            for call in &file.call_sites {
+                if call.callee == "click.command"
+                    || call.callee == "click.group"
+                    || call.callee == "app.command"
+                    || call.callee == "typer.command"
+                {
+                    if let Some(ref func) = call.containing_function {
+                        out.push(Entrypoint {
+                            file: file.path.clone(),
+                            symbol: func.clone(),
+                            entrypoint_type: EntrypointType::CliCommand,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // Go: check for cobra imports
+    if file.language == Language::Go {
+        let has_cobra = file
+            .imports
+            .iter()
+            .any(|i| i.source.starts_with("github.com/spf13/cobra"));
+        if has_cobra {
+            for call in &file.call_sites {
+                if call.callee.contains("cobra.Command") || call.callee.contains("AddCommand") {
+                    if let Some(ref func) = call.containing_function {
+                        out.push(Entrypoint {
+                            file: file.path.clone(),
+                            symbol: func.clone(),
+                            entrypoint_type: EntrypointType::CliCommand,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // Rust: check for clap imports
+    if file.language == Language::Rust {
+        let has_clap = file.imports.iter().any(|i| i.source.starts_with("clap"));
+        if has_clap {
+            for call in &file.call_sites {
+                if call.callee.contains("Command::new")
+                    || call.callee.contains("Parser::parse")
+                    || call.callee.contains("clap::Command")
+                {
+                    if let Some(ref func) = call.containing_function {
+                        out.push(Entrypoint {
+                            file: file.path.clone(),
+                            symbol: func.clone(),
+                            entrypoint_type: EntrypointType::CliCommand,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // JS/TS: check for commander/yargs imports
+    if matches!(file.language, Language::TypeScript | Language::JavaScript) {
+        let has_cli_framework = file.imports.iter().any(|i| {
+            i.source == "commander"
+                || i.source == "yargs"
+                || i.source == "meow"
+                || i.source == "cac"
+        });
+        if has_cli_framework {
+            out.push(Entrypoint {
+                file: file.path.clone(),
+                symbol: file_stem(&file.path),
+                entrypoint_type: EntrypointType::CliCommand,
+            });
+        }
+    }
+
+    // Check for bin-like file paths
+    if is_bin_path(&file.path) && !has_main {
+        out.push(Entrypoint {
+            file: file.path.clone(),
+            symbol: file_stem(&file.path),
+            entrypoint_type: EntrypointType::CliCommand,
+        });
+    }
+}
+
+fn is_cli_file_path(path: &str) -> bool {
+    path.contains("/cli/")
+        || path.contains("/cmd/")
+        || path.contains("/bin/")
+        || path.ends_with("/main.ts")
+        || path.ends_with("/main.js")
+        || path.ends_with("/cli.ts")
+        || path.ends_with("/cli.js")
+        || path.ends_with("/cli.py")
+        || path.ends_with("/main.go")
+}
+
+fn is_bin_path(path: &str) -> bool {
+    path.contains("/bin/") || path.starts_with("bin/")
+}
+
+// ---------------------------------------------------------------------------
+// Queue consumer detection
+// ---------------------------------------------------------------------------
+
+fn detect_queue_consumers(file: &ParsedFile, out: &mut Vec<Entrypoint>) {
+    let consumer_patterns = [
+        "subscribe",
+        "consume",
+        "onMessage",
+        "on_message",
+        "process",
+        "handle_message",
+        "handleMessage",
+    ];
+
+    let queue_imports = [
+        "amqplib",
+        "bull",
+        "bullmq",
+        "bee-queue",
+        "sqs-consumer",
+        "kafkajs",
+        "celery",
+        "kombu",
+        "pika",
+        "aio_pika",
+        "rq",
+    ];
+
+    let has_queue_import = file.imports.iter().any(|i| {
+        queue_imports
+            .iter()
+            .any(|q| i.source == *q || i.source.starts_with(&format!("{q}/")))
+    });
+
+    if !has_queue_import {
+        return;
+    }
+
+    // Look for consumer registration call sites
+    for call in &file.call_sites {
+        let callee_lower = call.callee.to_lowercase();
+        if consumer_patterns
+            .iter()
+            .any(|p| callee_lower.contains(&p.to_lowercase()))
+        {
+            let symbol = call
+                .containing_function
+                .clone()
+                .unwrap_or_else(|| call.callee.clone());
+            out.push(Entrypoint {
+                file: file.path.clone(),
+                symbol,
+                entrypoint_type: EntrypointType::QueueConsumer,
+            });
+        }
+    }
+
+    // Check for worker/consumer file path patterns
+    if is_worker_path(&file.path) {
+        for def in &file.definitions {
+            if def.kind == crate::types::SymbolKind::Function
+                && (def.name.contains("process")
+                    || def.name.contains("handle")
+                    || def.name.contains("consume")
+                    || def.name == "run"
+                    || def.name == "execute")
+            {
+                out.push(Entrypoint {
+                    file: file.path.clone(),
+                    symbol: def.name.clone(),
+                    entrypoint_type: EntrypointType::QueueConsumer,
+                });
+            }
+        }
+    }
+}
+
+fn is_worker_path(path: &str) -> bool {
+    path.contains("/workers/")
+        || path.contains("/jobs/")
+        || path.contains("/consumers/")
+        || path.contains("/tasks/")
+        || path.ends_with("_worker.py")
+        || path.ends_with("_worker.ts")
+        || path.ends_with("_worker.js")
+        || path.ends_with("Worker.ts")
+        || path.ends_with("Worker.js")
+}
+
+// ---------------------------------------------------------------------------
+// Cron job detection
+// ---------------------------------------------------------------------------
+
+fn detect_cron_jobs(file: &ParsedFile, out: &mut Vec<Entrypoint>) {
+    let cron_imports = [
+        "node-cron",
+        "cron",
+        "node-schedule",
+        "agenda",
+        "apscheduler",
+        "schedule",
+        "celery",
+        "celery.schedules",
+    ];
+
+    let has_cron_import = file.imports.iter().any(|i| {
+        cron_imports
+            .iter()
+            .any(|c| i.source == *c || i.source.starts_with(&format!("{c}.")))
+    });
+
+    if !has_cron_import && !is_cron_path(&file.path) {
+        return;
+    }
+
+    let cron_call_patterns = ["schedule", "cron", "every", "interval", "addJob", "add_job"];
+
+    for call in &file.call_sites {
+        if cron_call_patterns.iter().any(|p| call.callee.contains(p)) {
+            let symbol = call
+                .containing_function
+                .clone()
+                .unwrap_or_else(|| call.callee.clone());
+            out.push(Entrypoint {
+                file: file.path.clone(),
+                symbol,
+                entrypoint_type: EntrypointType::CronJob,
+            });
+        }
+    }
+}
+
+fn is_cron_path(path: &str) -> bool {
+    path.contains("/cron/")
+        || path.contains("/scheduler/")
+        || path.contains("/scheduled/")
+        || path.ends_with("_cron.py")
+        || path.ends_with("_scheduler.py")
+}
+
+// ---------------------------------------------------------------------------
+// React page detection
+// ---------------------------------------------------------------------------
+
+fn detect_react_pages(file: &ParsedFile, out: &mut Vec<Entrypoint>) {
+    if !matches!(file.language, Language::TypeScript | Language::JavaScript) {
+        return;
+    }
+
+    // Already handled by HTTP route detection for Next.js route files
+    if is_nextjs_route_file(&file.path) {
+        return;
+    }
+
+    // React page conventions: default export from pages/ or app/ directories
+    let is_page = is_react_page_path(&file.path);
+    if !is_page {
+        return;
+    }
+
+    for export in &file.exports {
+        if export.is_default {
+            out.push(Entrypoint {
+                file: file.path.clone(),
+                symbol: export.name.clone(),
+                entrypoint_type: EntrypointType::ReactPage,
+            });
+            return;
+        }
+    }
+
+    // Also check for page.tsx (Next.js App Router page component)
+    if file
+        .path
+        .split('/')
+        .last()
+        .map_or(false, |f| f.starts_with("page."))
+    {
+        for export in &file.exports {
+            if export.is_default {
+                out.push(Entrypoint {
+                    file: file.path.clone(),
+                    symbol: export.name.clone(),
+                    entrypoint_type: EntrypointType::ReactPage,
+                });
+                return;
+            }
+        }
+    }
+}
+
+fn is_react_page_path(path: &str) -> bool {
+    let lower = path.to_lowercase();
+    // Next.js App Router page.tsx
+    let filename = path.split('/').last().unwrap_or("");
+    if filename.starts_with("page.") {
+        return true;
+    }
+    // Pages directory (excluding API routes and internals)
+    let in_pages = lower.contains("/pages/") || lower.starts_with("pages/");
+    if in_pages {
+        return !lower.contains("/api/") && !filename.starts_with('_');
+    }
+    false
+}
+
+// ---------------------------------------------------------------------------
+// Event handler detection
+// ---------------------------------------------------------------------------
+
+fn detect_event_handlers(file: &ParsedFile, out: &mut Vec<Entrypoint>) {
+    let listener_patterns = ["addEventListener", "on", "addListener", "once", "subscribe"];
+
+    let event_imports = ["events", "eventemitter3", "mitt", "rxjs", "socket.io", "ws"];
+
+    let has_event_import = file.imports.iter().any(|i| {
+        event_imports
+            .iter()
+            .any(|e| i.source == *e || i.source.starts_with(&format!("{e}/")))
+    });
+
+    if !has_event_import {
+        return;
+    }
+
+    for call in &file.call_sites {
+        // Match patterns like emitter.on(), socket.addEventListener(), etc.
+        let callee_parts: Vec<&str> = call.callee.rsplitn(2, '.').collect();
+        if callee_parts.len() == 2 {
+            let method = callee_parts[0];
+            if listener_patterns.contains(&method) {
+                let symbol = call
+                    .containing_function
+                    .clone()
+                    .unwrap_or_else(|| call.callee.clone());
+                out.push(Entrypoint {
+                    file: file.path.clone(),
+                    symbol,
+                    entrypoint_type: EntrypointType::EventHandler,
+                });
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Effect.ts entrypoint detection
+// ---------------------------------------------------------------------------
+
+fn detect_effect_ts(file: &ParsedFile, out: &mut Vec<Entrypoint>) {
+    if !matches!(file.language, Language::TypeScript | Language::JavaScript) {
+        return;
+    }
+
+    detect_effect_http_routes(file, out);
+    detect_effect_cli_commands(file, out);
+    detect_effect_queue_consumers(file, out);
+    detect_effect_cron_jobs(file, out);
+    detect_effect_test_files(file, out);
+    detect_effect_event_handlers(file, out);
+    detect_effect_services(file, out);
+}
+
+/// Check if an import source is from the Effect platform HTTP packages.
+fn has_effect_http_import(imports: &[ImportInfo]) -> bool {
+    imports.iter().any(|i| {
+        i.source == "@effect/platform"
+            || i.source.starts_with("@effect/platform/Http")
+            || i.source == "@effect/platform-node"
+            || i.source == "@effect/platform-bun"
+    })
+}
+
+/// Check if specific Effect HTTP names are imported.
+fn has_effect_http_name(imports: &[ImportInfo]) -> bool {
+    let http_names = [
+        "HttpApi",
+        "HttpApiEndpoint",
+        "HttpApiGroup",
+        "HttpRouter",
+        "HttpServer",
+        "HttpApiBuilder",
+    ];
+    imports.iter().any(|i| {
+        // Direct subpath import like @effect/platform/HttpApi
+        if let Some(last) = i.source.rsplit('/').next() {
+            if http_names.contains(&last) {
+                return true;
+            }
+        }
+        // Named import from @effect/platform
+        i.names
+            .iter()
+            .any(|n| http_names.contains(&n.name.as_str()))
+    })
+}
+
+/// Detect Effect.ts HTTP routes: HttpApi, HttpApiEndpoint, HttpApiGroup, HttpRouter, HttpServer.
+fn detect_effect_http_routes(file: &ParsedFile, out: &mut Vec<Entrypoint>) {
+    if !has_effect_http_import(&file.imports) && !has_effect_http_name(&file.imports) {
+        return;
+    }
+
+    let route_call_prefixes = [
+        "HttpApiEndpoint.get",
+        "HttpApiEndpoint.post",
+        "HttpApiEndpoint.put",
+        "HttpApiEndpoint.del",
+        "HttpApiEndpoint.delete",
+        "HttpApiEndpoint.patch",
+        "HttpApiEndpoint.head",
+        "HttpApiEndpoint.options",
+        "HttpApiEndpoint.make",
+        "HttpApi.make",
+        "HttpApi.empty",
+        "HttpApiGroup.make",
+        "HttpRouter.get",
+        "HttpRouter.post",
+        "HttpRouter.put",
+        "HttpRouter.del",
+        "HttpRouter.delete",
+        "HttpRouter.patch",
+        "HttpRouter.all",
+        "HttpRouter.mount",
+        "HttpRouter.route",
+    ];
+
+    for call in &file.call_sites {
+        if route_call_prefixes.iter().any(|p| call.callee == *p) {
+            let symbol = call
+                .containing_function
+                .clone()
+                .unwrap_or_else(|| call.callee.clone());
+            out.push(Entrypoint {
+                file: file.path.clone(),
+                symbol,
+                entrypoint_type: EntrypointType::HttpRoute,
+            });
+        }
+    }
+
+    // Also check definitions that reference HttpApi/HttpRouter types
+    let http_def_names = ["HttpApi", "HttpApiGroup", "HttpRouter"];
+    for def in &file.definitions {
+        if http_def_names.iter().any(|n| def.name.contains(n)) {
+            out.push(Entrypoint {
+                file: file.path.clone(),
+                symbol: def.name.clone(),
+                entrypoint_type: EntrypointType::HttpRoute,
+            });
+        }
+    }
+}
+
+/// Detect Effect.ts CLI commands: @effect/cli Command, Args, Options.
+fn detect_effect_cli_commands(file: &ParsedFile, out: &mut Vec<Entrypoint>) {
+    let has_cli_import = file.imports.iter().any(|i| {
+        i.source == "@effect/cli"
+            || i.source.starts_with("@effect/cli/")
+            || i.names
+                .iter()
+                .any(|n| n.name == "Command" || n.name == "Args" || n.name == "Options")
+                && i.source.starts_with("@effect/cli")
+    });
+
+    if !has_cli_import {
+        return;
+    }
+
+    let cli_calls = [
+        "Command.make",
+        "Command.run",
+        "Command.provide",
+        "Command.withHandler",
+    ];
+
+    for call in &file.call_sites {
+        if cli_calls.iter().any(|c| call.callee == *c) {
+            let symbol = call
+                .containing_function
+                .clone()
+                .unwrap_or_else(|| call.callee.clone());
+            out.push(Entrypoint {
+                file: file.path.clone(),
+                symbol,
+                entrypoint_type: EntrypointType::CliCommand,
+            });
+        }
+    }
+}
+
+/// Detect Effect.ts queue consumers: Queue, PubSub consumer patterns.
+fn detect_effect_queue_consumers(file: &ParsedFile, out: &mut Vec<Entrypoint>) {
+    let has_queue_import = file.imports.iter().any(|i| {
+        (i.source == "effect" || i.source == "effect/Queue" || i.source == "effect/PubSub")
+            && i.names
+                .iter()
+                .any(|n| n.name == "Queue" || n.name == "PubSub")
+            || i.source == "effect/Queue"
+            || i.source == "effect/PubSub"
+    });
+
+    if !has_queue_import {
+        return;
+    }
+
+    let consumer_calls = [
+        "Queue.take",
+        "Queue.poll",
+        "Queue.dequeue",
+        "Queue.takeBetween",
+        "Queue.takeAll",
+        "Queue.takeUpTo",
+        "PubSub.subscribe",
+        "PubSub.subscribeScopedWith",
+    ];
+
+    for call in &file.call_sites {
+        if consumer_calls.iter().any(|c| call.callee == *c) {
+            let symbol = call
+                .containing_function
+                .clone()
+                .unwrap_or_else(|| call.callee.clone());
+            out.push(Entrypoint {
+                file: file.path.clone(),
+                symbol,
+                entrypoint_type: EntrypointType::QueueConsumer,
+            });
+        }
+    }
+}
+
+/// Detect Effect.ts cron jobs: Schedule, @effect/cron patterns.
+fn detect_effect_cron_jobs(file: &ParsedFile, out: &mut Vec<Entrypoint>) {
+    let has_schedule_import = file.imports.iter().any(|i| {
+        i.source == "@effect/cron"
+            || i.source.starts_with("@effect/cron/")
+            || ((i.source == "effect" || i.source == "effect/Schedule")
+                && i.names.iter().any(|n| n.name == "Schedule"))
+            || i.source == "effect/Schedule"
+    });
+
+    if !has_schedule_import {
+        return;
+    }
+
+    let schedule_calls = [
+        "Schedule.cron",
+        "Schedule.fixed",
+        "Schedule.spaced",
+        "Schedule.recurring",
+        "Schedule.forever",
+        "Schedule.once",
+        "Schedule.dayOfWeek",
+        "Schedule.hourOfDay",
+        "Cron.make",
+        "Cron.parse",
+        "Cron.match",
+    ];
+
+    for call in &file.call_sites {
+        if schedule_calls.iter().any(|c| call.callee == *c) {
+            let symbol = call
+                .containing_function
+                .clone()
+                .unwrap_or_else(|| call.callee.clone());
+            out.push(Entrypoint {
+                file: file.path.clone(),
+                symbol,
+                entrypoint_type: EntrypointType::CronJob,
+            });
+        }
+    }
+}
+
+/// Detect Effect.ts test files: @effect/vitest it.effect, it.scoped patterns.
+fn detect_effect_test_files(file: &ParsedFile, out: &mut Vec<Entrypoint>) {
+    let has_vitest_import = file
+        .imports
+        .iter()
+        .any(|i| i.source == "@effect/vitest" || i.source.starts_with("@effect/vitest/"));
+
+    if !has_vitest_import {
+        return;
+    }
+
+    let test_calls = ["it.effect", "it.scoped", "it.live", "it.flakyTest"];
+
+    for call in &file.call_sites {
+        if test_calls.iter().any(|c| call.callee == *c) {
+            let symbol = call
+                .containing_function
+                .clone()
+                .unwrap_or_else(|| call.callee.clone());
+            out.push(Entrypoint {
+                file: file.path.clone(),
+                symbol,
+                entrypoint_type: EntrypointType::TestFile,
+            });
+        }
+    }
+}
+
+/// Detect Effect.ts event handlers: Stream, PubSub, Hub listener patterns.
+fn detect_effect_event_handlers(file: &ParsedFile, out: &mut Vec<Entrypoint>) {
+    let has_stream_import = file.imports.iter().any(|i| {
+        (i.source == "effect"
+            && i.names
+                .iter()
+                .any(|n| n.name == "Stream" || n.name == "Hub"))
+            || i.source == "effect/Stream"
+            || i.source == "effect/Hub"
+    });
+
+    if !has_stream_import {
+        return;
+    }
+
+    let handler_calls = [
+        "Stream.run",
+        "Stream.runForEach",
+        "Stream.runCollect",
+        "Stream.runDrain",
+        "Stream.runFold",
+        "Stream.runScoped",
+        "Hub.subscribe",
+        "Hub.publishAll",
+    ];
+
+    for call in &file.call_sites {
+        if handler_calls.iter().any(|c| call.callee == *c) {
+            let symbol = call
+                .containing_function
+                .clone()
+                .unwrap_or_else(|| call.callee.clone());
+            out.push(Entrypoint {
+                file: file.path.clone(),
+                symbol,
+                entrypoint_type: EntrypointType::EventHandler,
+            });
+        }
+    }
+}
+
+/// Detect Effect.ts services: Effect.Service, Context.Tag, Layer definitions.
+fn detect_effect_services(file: &ParsedFile, out: &mut Vec<Entrypoint>) {
+    let has_effect_import = file.imports.iter().any(|i| {
+        (i.source == "effect"
+            && i.names
+                .iter()
+                .any(|n| n.name == "Effect" || n.name == "Context" || n.name == "Layer"))
+            || i.source == "effect/Effect"
+            || i.source == "effect/Context"
+            || i.source == "effect/Layer"
+    });
+
+    if !has_effect_import {
+        return;
+    }
+
+    let service_calls = [
+        "Effect.Service",
+        "Context.Tag",
+        "Context.GenericTag",
+        "Layer.effect",
+        "Layer.succeed",
+        "Layer.scoped",
+        "Layer.sync",
+        "Layer.fail",
+        "Layer.provide",
+        "Layer.merge",
+    ];
+
+    for call in &file.call_sites {
+        if service_calls.iter().any(|c| call.callee == *c) {
+            let symbol = call
+                .containing_function
+                .clone()
+                .unwrap_or_else(|| call.callee.clone());
+            out.push(Entrypoint {
+                file: file.path.clone(),
+                symbol,
+                entrypoint_type: EntrypointType::EffectService,
+            });
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rust module/plugin entrypoint detection
+// ---------------------------------------------------------------------------
+
+/// Detect Rust module/plugin entrypoints by path convention.
+///
+/// Many Rust projects use a module/plugin pattern where each file in
+/// `src/modules/`, `src/commands/`, `src/plugins/`, `src/handlers/` etc.
+/// is a self-contained entrypoint. Also detects `main.rs` and `lib.rs`
+/// as structural entrypoints when they define public functions.
+fn detect_rust_modules(file: &ParsedFile, out: &mut Vec<Entrypoint>) {
+    if file.language != Language::Rust {
+        return;
+    }
+
+    let lower = file.path.to_lowercase();
+
+    // Rust module/plugin directories — files here are treated as entrypoints
+    let is_module_path = lower.contains("/modules/")
+        || lower.contains("/commands/")
+        || lower.contains("/plugins/")
+        || lower.contains("/handlers/")
+        || lower.contains("/subcommands/")
+        || lower.contains("/cmds/");
+
+    // Skip mod.rs — it's a re-export barrel, not a module entrypoint itself
+    let is_mod_rs = lower.ends_with("/mod.rs");
+
+    if is_module_path && !is_mod_rs {
+        let stem = file_stem(&file.path);
+        out.push(Entrypoint {
+            file: file.path.clone(),
+            symbol: stem,
+            entrypoint_type: EntrypointType::CliCommand,
+        });
+    }
+
+    // Paired config files (src/configs/*.rs) that mirror modules
+    // These are entrypoints because they define the config struct for a module
+    let is_config_path = lower.contains("/configs/") && !is_mod_rs;
+    if is_config_path {
+        let stem = file_stem(&file.path);
+        out.push(Entrypoint {
+            file: file.path.clone(),
+            symbol: stem,
+            entrypoint_type: EntrypointType::CliCommand,
+        });
+    }
+
+    // main.rs / lib.rs as structural entrypoints (if they have definitions)
+    let is_root_rs = lower.ends_with("/main.rs")
+        || lower.ends_with("/lib.rs")
+        || lower == "src/main.rs"
+        || lower == "src/lib.rs";
+    if is_root_rs && !file.definitions.is_empty() {
+        out.push(Entrypoint {
+            file: file.path.clone(),
+            symbol: file_stem(&file.path),
+            entrypoint_type: EntrypointType::CliCommand,
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Utilities
+// ---------------------------------------------------------------------------
+
+fn file_stem(path: &str) -> String {
+    path.split('/')
+        .last()
+        .unwrap_or(path)
+        .split('.')
+        .next()
+        .unwrap_or(path)
+        .to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
+mod tests {
+    use super::*;
+    use crate::ast::{CallSite, Definition, ExportInfo, ImportInfo, ImportedName};
+    use crate::types::SymbolKind;
+
+    fn make_file(path: &str, lang: Language) -> ParsedFile {
+        ParsedFile {
+            path: path.to_string(),
+            language: lang,
+            definitions: vec![],
+            imports: vec![],
+            exports: vec![],
+            call_sites: vec![],
+        }
+    }
+
+    fn make_def(name: &str, kind: SymbolKind) -> Definition {
+        Definition {
+            name: name.to_string(),
+            kind,
+            start_line: 1,
+            end_line: 5,
+        }
+    }
+
+    fn make_import(source: &str) -> ImportInfo {
+        ImportInfo {
+            source: source.to_string(),
+            names: vec![],
+            is_default: false,
+            is_namespace: false,
+            line: 1,
+        }
+    }
+
+    fn make_import_with_names(source: &str, names: Vec<&str>) -> ImportInfo {
+        ImportInfo {
+            source: source.to_string(),
+            names: names
+                .into_iter()
+                .map(|n| ImportedName {
+                    name: n.to_string(),
+                    alias: None,
+                })
+                .collect(),
+            is_default: false,
+            is_namespace: false,
+            line: 1,
+        }
+    }
+
+    fn make_export(name: &str, is_default: bool) -> ExportInfo {
+        ExportInfo {
+            name: name.to_string(),
+            is_default,
+            is_reexport: false,
+            source: None,
+            line: 1,
+        }
+    }
+
+    fn make_call(callee: &str, containing: Option<&str>) -> CallSite {
+        CallSite {
+            callee: callee.to_string(),
+            line: 1,
+            containing_function: containing.map(|s| s.to_string()),
+        }
+    }
+
+    // ========================================================================
+    // Test file detection
+    // ========================================================================
+
+    #[test]
+    fn test_detect_test_file_by_path_dot_test() {
+        let file = make_file("src/utils.test.ts", Language::TypeScript);
+        let result = detect_entrypoints(&[file]);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].entrypoint_type, EntrypointType::TestFile);
+        assert_eq!(result[0].symbol, "utils");
+    }
+
+    #[test]
+    fn test_detect_test_file_by_path_dot_spec() {
+        let file = make_file("src/utils.spec.js", Language::JavaScript);
+        let result = detect_entrypoints(&[file]);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].entrypoint_type, EntrypointType::TestFile);
+    }
+
+    #[test]
+    fn test_detect_test_file_python_prefix() {
+        let file = make_file("tests/test_utils.py", Language::Python);
+        let result = detect_entrypoints(&[file]);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].entrypoint_type, EntrypointType::TestFile);
+    }
+
+    #[test]
+    fn test_detect_test_file_tests_directory() {
+        let file = make_file("__tests__/App.test.tsx", Language::TypeScript);
+        let result = detect_entrypoints(&[file]);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].entrypoint_type, EntrypointType::TestFile);
+    }
+
+    #[test]
+    fn test_detect_test_file_with_test_functions() {
+        let mut file = make_file("tests/test_auth.py", Language::Python);
+        file.definitions = vec![
+            make_def("test_login", SymbolKind::Function),
+            make_def("test_logout", SymbolKind::Function),
+            make_def("helper_setup", SymbolKind::Function),
+        ];
+        let result = detect_entrypoints(&[file]);
+        // Should detect test_login and test_logout but not helper_setup
+        assert_eq!(result.len(), 2);
+        assert!(result.iter().any(|e| e.symbol == "test_login"));
+        assert!(result.iter().any(|e| e.symbol == "test_logout"));
+    }
+
+    #[test]
+    fn test_non_test_file_not_detected() {
+        let file = make_file("src/utils.ts", Language::TypeScript);
+        let result = detect_entrypoints(&[file]);
+        assert!(result.is_empty());
+    }
+
+    // ========================================================================
+    // HTTP route detection — JS/TS
+    // ========================================================================
+
+    #[test]
+    fn test_detect_express_route() {
+        let mut file = make_file("src/routes/users.ts", Language::TypeScript);
+        file.call_sites = vec![
+            make_call("app.get", Some("setupRoutes")),
+            make_call("app.post", Some("setupRoutes")),
+        ];
+        let result = detect_entrypoints(&[file]);
+        assert!(!result.is_empty());
+        assert!(result
+            .iter()
+            .all(|e| e.entrypoint_type == EntrypointType::HttpRoute));
+    }
+
+    #[test]
+    fn test_detect_router_route() {
+        let mut file = make_file("src/routes/api.ts", Language::TypeScript);
+        file.call_sites = vec![make_call("router.get", Some("getUsers"))];
+        let result = detect_entrypoints(&[file]);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].symbol, "getUsers");
+        assert_eq!(result[0].entrypoint_type, EntrypointType::HttpRoute);
+    }
+
+    #[test]
+    fn test_detect_nextjs_app_router_route() {
+        let mut file = make_file("src/app/api/users/route.ts", Language::TypeScript);
+        file.exports = vec![make_export("GET", false), make_export("POST", false)];
+        let result = detect_entrypoints(&[file]);
+        assert_eq!(result.len(), 2);
+        assert!(result.iter().any(|e| e.symbol == "GET"));
+        assert!(result.iter().any(|e| e.symbol == "POST"));
+        assert!(result
+            .iter()
+            .all(|e| e.entrypoint_type == EntrypointType::HttpRoute));
+    }
+
+    #[test]
+    fn test_detect_nextjs_pages_router() {
+        let mut file = make_file("pages/about.tsx", Language::TypeScript);
+        file.exports = vec![make_export("AboutPage", true)];
+        let result = detect_entrypoints(&[file]);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].symbol, "AboutPage");
+        assert_eq!(result[0].entrypoint_type, EntrypointType::HttpRoute);
+    }
+
+    #[test]
+    fn test_nextjs_pages_skip_internal_files() {
+        let mut file = make_file("pages/_app.tsx", Language::TypeScript);
+        file.exports = vec![make_export("App", true)];
+        let result = detect_entrypoints(&[file]);
+        // _app.tsx should NOT be detected as a page route
+        assert!(result
+            .iter()
+            .all(|e| e.entrypoint_type != EntrypointType::HttpRoute));
+    }
+
+    #[test]
+    fn test_non_route_call_not_detected() {
+        let mut file = make_file("src/utils.ts", Language::TypeScript);
+        file.call_sites = vec![make_call("console.log", Some("debug"))];
+        let result = detect_entrypoints(&[file]);
+        assert!(result.is_empty());
+    }
+
+    // ========================================================================
+    // HTTP route detection — Python
+    // ========================================================================
+
+    #[test]
+    fn test_detect_flask_route() {
+        let mut file = make_file("src/routes.py", Language::Python);
+        file.imports = vec![make_import_with_names("flask", vec!["Flask"])];
+        file.call_sites = vec![make_call("app.route", Some("list_users"))];
+        let result = detect_entrypoints(&[file]);
+        assert!(result
+            .iter()
+            .any(|e| e.symbol == "list_users" && e.entrypoint_type == EntrypointType::HttpRoute));
+    }
+
+    #[test]
+    fn test_detect_fastapi_route() {
+        let mut file = make_file("src/routes.py", Language::Python);
+        file.imports = vec![make_import_with_names("fastapi", vec!["FastAPI"])];
+        file.call_sites = vec![make_call("app.get", Some("get_users"))];
+        let result = detect_entrypoints(&[file]);
+        assert!(result
+            .iter()
+            .any(|e| e.symbol == "get_users" && e.entrypoint_type == EntrypointType::HttpRoute));
+    }
+
+    #[test]
+    fn test_detect_python_views_module() {
+        let mut file = make_file("myapp/views.py", Language::Python);
+        file.imports = vec![make_import("django.http")];
+        file.definitions = vec![
+            make_def("index", SymbolKind::Function),
+            make_def("detail", SymbolKind::Function),
+            make_def("__init__", SymbolKind::Function),
+            make_def("_helper", SymbolKind::Function),
+        ];
+        let result = detect_entrypoints(&[file]);
+        // Should detect index and detail, but not __init__ or _helper
+        let http_routes: Vec<_> = result
+            .iter()
+            .filter(|e| e.entrypoint_type == EntrypointType::HttpRoute)
+            .collect();
+        assert_eq!(http_routes.len(), 2);
+        assert!(http_routes.iter().any(|e| e.symbol == "index"));
+        assert!(http_routes.iter().any(|e| e.symbol == "detail"));
+    }
+
+    // ========================================================================
+    // CLI command detection
+    // ========================================================================
+
+    #[test]
+    fn test_detect_python_main() {
+        let mut file = make_file("src/cli.py", Language::Python);
+        file.definitions = vec![make_def("main", SymbolKind::Function)];
+        let result = detect_entrypoints(&[file]);
+        assert!(result
+            .iter()
+            .any(|e| e.symbol == "main" && e.entrypoint_type == EntrypointType::CliCommand));
+    }
+
+    #[test]
+    fn test_detect_ts_main_in_cli_path() {
+        let mut file = make_file("src/cli/main.ts", Language::TypeScript);
+        file.definitions = vec![make_def("main", SymbolKind::Function)];
+        let result = detect_entrypoints(&[file]);
+        assert!(result
+            .iter()
+            .any(|e| e.symbol == "main" && e.entrypoint_type == EntrypointType::CliCommand));
+    }
+
+    #[test]
+    fn test_detect_commander_cli() {
+        let mut file = make_file("src/cli.ts", Language::TypeScript);
+        file.imports = vec![make_import("commander")];
+        let result = detect_entrypoints(&[file]);
+        assert!(result
+            .iter()
+            .any(|e| e.entrypoint_type == EntrypointType::CliCommand));
+    }
+
+    #[test]
+    fn test_detect_click_cli() {
+        let mut file = make_file("src/main.py", Language::Python);
+        file.imports = vec![make_import("click")];
+        file.definitions = vec![make_def("main", SymbolKind::Function)];
+        file.call_sites = vec![make_call("click.command", Some("main"))];
+        let result = detect_entrypoints(&[file]);
+        let cli_entries: Vec<_> = result
+            .iter()
+            .filter(|e| e.entrypoint_type == EntrypointType::CliCommand)
+            .collect();
+        assert!(!cli_entries.is_empty());
+    }
+
+    #[test]
+    fn test_detect_bin_path_as_cli() {
+        let file = make_file("bin/run.js", Language::JavaScript);
+        let result = detect_entrypoints(&[file]);
+        assert!(result
+            .iter()
+            .any(|e| e.entrypoint_type == EntrypointType::CliCommand));
+    }
+
+    #[test]
+    fn test_main_in_non_cli_path_not_cli_for_ts() {
+        // A main() in a random TS file shouldn't be CLI
+        let mut file = make_file("src/components/Widget.ts", Language::TypeScript);
+        file.definitions = vec![make_def("main", SymbolKind::Function)];
+        let result = detect_entrypoints(&[file]);
+        assert!(result
+            .iter()
+            .all(|e| e.entrypoint_type != EntrypointType::CliCommand));
+    }
+
+    // ========================================================================
+    // Queue consumer detection
+    // ========================================================================
+
+    #[test]
+    fn test_detect_bull_queue_consumer() {
+        let mut file = make_file("src/workers/email.ts", Language::TypeScript);
+        file.imports = vec![make_import("bullmq")];
+        file.call_sites = vec![make_call("queue.process", Some("processEmail"))];
+        let result = detect_entrypoints(&[file]);
+        assert!(result
+            .iter()
+            .any(|e| e.entrypoint_type == EntrypointType::QueueConsumer));
+    }
+
+    #[test]
+    fn test_detect_celery_consumer() {
+        let mut file = make_file("src/tasks/send_email.py", Language::Python);
+        file.imports = vec![make_import("celery")];
+        file.definitions = vec![make_def("process_email", SymbolKind::Function)];
+        // Worker path + celery import → queue consumer for process-like functions
+        let result = detect_entrypoints(&[file]);
+        assert!(result
+            .iter()
+            .any(|e| e.entrypoint_type == EntrypointType::QueueConsumer));
+    }
+
+    #[test]
+    fn test_no_queue_without_import() {
+        let mut file = make_file("src/workers/email.ts", Language::TypeScript);
+        file.call_sites = vec![make_call("queue.process", Some("processEmail"))];
+        // No queue import → no detection
+        let result = detect_entrypoints(&[file]);
+        assert!(result
+            .iter()
+            .all(|e| e.entrypoint_type != EntrypointType::QueueConsumer));
+    }
+
+    // ========================================================================
+    // Cron job detection
+    // ========================================================================
+
+    #[test]
+    fn test_detect_node_cron() {
+        let mut file = make_file("src/cron/cleanup.ts", Language::TypeScript);
+        file.imports = vec![make_import("node-cron")];
+        file.call_sites = vec![make_call("cron.schedule", Some("scheduleCleanup"))];
+        let result = detect_entrypoints(&[file]);
+        assert!(result
+            .iter()
+            .any(|e| e.entrypoint_type == EntrypointType::CronJob));
+    }
+
+    #[test]
+    fn test_detect_apscheduler() {
+        let mut file = make_file("src/scheduler/jobs.py", Language::Python);
+        file.imports = vec![make_import("apscheduler")];
+        file.call_sites = vec![make_call("scheduler.add_job", Some("daily_report"))];
+        let result = detect_entrypoints(&[file]);
+        assert!(result
+            .iter()
+            .any(|e| e.entrypoint_type == EntrypointType::CronJob));
+    }
+
+    // ========================================================================
+    // React page detection
+    // ========================================================================
+
+    #[test]
+    fn test_detect_nextjs_page_tsx() {
+        let mut file = make_file("src/app/dashboard/page.tsx", Language::TypeScript);
+        file.exports = vec![make_export("DashboardPage", true)];
+        let result = detect_entrypoints(&[file]);
+        assert!(
+            result
+                .iter()
+                .any(|e| e.symbol == "DashboardPage"
+                    && e.entrypoint_type == EntrypointType::ReactPage)
+        );
+    }
+
+    #[test]
+    fn test_detect_pages_dir_page() {
+        let mut file = make_file("pages/dashboard.tsx", Language::TypeScript);
+        file.exports = vec![make_export("Dashboard", true)];
+        let result = detect_entrypoints(&[file]);
+        // Should be detected as either HttpRoute (from pages router detection) or ReactPage
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn test_python_file_not_react_page() {
+        let mut file = make_file("pages/admin.py", Language::Python);
+        file.exports = vec![];
+        let result = detect_entrypoints(&[file]);
+        assert!(result
+            .iter()
+            .all(|e| e.entrypoint_type != EntrypointType::ReactPage));
+    }
+
+    // ========================================================================
+    // Event handler detection
+    // ========================================================================
+
+    #[test]
+    fn test_detect_socket_event_handler() {
+        let mut file = make_file("src/socket/handler.ts", Language::TypeScript);
+        file.imports = vec![make_import("socket.io")];
+        file.call_sites = vec![make_call("socket.on", Some("handleConnection"))];
+        let result = detect_entrypoints(&[file]);
+        assert!(result
+            .iter()
+            .any(|e| e.entrypoint_type == EntrypointType::EventHandler));
+    }
+
+    #[test]
+    fn test_detect_eventemitter_handler() {
+        let mut file = make_file("src/events/listener.ts", Language::TypeScript);
+        file.imports = vec![make_import("events")];
+        file.call_sites = vec![make_call("emitter.addListener", Some("onUserCreated"))];
+        let result = detect_entrypoints(&[file]);
+        assert!(result
+            .iter()
+            .any(|e| e.entrypoint_type == EntrypointType::EventHandler));
+    }
+
+    #[test]
+    fn test_no_event_handler_without_import() {
+        let mut file = make_file("src/events/listener.ts", Language::TypeScript);
+        file.call_sites = vec![make_call("emitter.on", Some("handler"))];
+        // No event import → no detection
+        let result = detect_entrypoints(&[file]);
+        assert!(result
+            .iter()
+            .all(|e| e.entrypoint_type != EntrypointType::EventHandler));
+    }
+
+    // ========================================================================
+    // Multi-entrypoint and deduplication
+    // ========================================================================
+
+    #[test]
+    fn test_multiple_files_multiple_entrypoints() {
+        let mut route_file = make_file("src/routes/users.ts", Language::TypeScript);
+        route_file.call_sites = vec![
+            make_call("router.get", Some("getUsers")),
+            make_call("router.post", Some("createUser")),
+        ];
+
+        let test_file = make_file("src/routes/users.test.ts", Language::TypeScript);
+
+        let mut cli_file = make_file("src/cli/main.ts", Language::TypeScript);
+        cli_file.definitions = vec![make_def("main", SymbolKind::Function)];
+
+        let result = detect_entrypoints(&[route_file, test_file, cli_file]);
+
+        let types: Vec<_> = result.iter().map(|e| &e.entrypoint_type).collect();
+        assert!(types.contains(&&EntrypointType::HttpRoute));
+        assert!(types.contains(&&EntrypointType::TestFile));
+        assert!(types.contains(&&EntrypointType::CliCommand));
+    }
+
+    #[test]
+    fn test_deduplication() {
+        // A file that could trigger the same entrypoint via multiple detection paths
+        let mut file = make_file("src/app/api/users/route.ts", Language::TypeScript);
+        file.exports = vec![make_export("GET", false)];
+
+        let result = detect_entrypoints(&[file]);
+        // Should not have duplicates
+        let get_entries: Vec<_> = result
+            .iter()
+            .filter(|e| e.symbol == "GET" && e.file == "src/app/api/users/route.ts")
+            .collect();
+        assert_eq!(get_entries.len(), 1);
+    }
+
+    #[test]
+    fn test_empty_input() {
+        let result = detect_entrypoints(&[]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_no_entrypoints_in_plain_utility() {
+        let mut file = make_file("src/utils/format.ts", Language::TypeScript);
+        file.definitions = vec![
+            make_def("formatDate", SymbolKind::Function),
+            make_def("formatCurrency", SymbolKind::Function),
+        ];
+        file.imports = vec![make_import("date-fns")];
+        let result = detect_entrypoints(&[file]);
+        assert!(result.is_empty());
+    }
+
+    // ========================================================================
+    // Edge cases
+    // ========================================================================
+
+    // ========================================================================
+    // Effect.ts HTTP route detection
+    // ========================================================================
+
+    #[test]
+    fn test_detect_effect_http_api_endpoint() {
+        let mut file = make_file("src/api/users.ts", Language::TypeScript);
+        file.imports = vec![make_import_with_names(
+            "@effect/platform",
+            vec!["HttpApiEndpoint", "HttpApi"],
+        )];
+        file.call_sites = vec![
+            make_call("HttpApiEndpoint.get", Some("getUserEndpoint")),
+            make_call("HttpApiEndpoint.post", Some("createUserEndpoint")),
+        ];
+        let result = detect_entrypoints(&[file]);
+        let http: Vec<_> = result
+            .iter()
+            .filter(|e| e.entrypoint_type == EntrypointType::HttpRoute)
+            .collect();
+        assert_eq!(http.len(), 2);
+        assert!(http.iter().any(|e| e.symbol == "getUserEndpoint"));
+        assert!(http.iter().any(|e| e.symbol == "createUserEndpoint"));
+    }
+
+    #[test]
+    fn test_detect_effect_http_api_make() {
+        let mut file = make_file("src/api/index.ts", Language::TypeScript);
+        file.imports = vec![make_import("@effect/platform/HttpApi")];
+        file.call_sites = vec![make_call("HttpApi.make", Some("makeApi"))];
+        let result = detect_entrypoints(&[file]);
+        assert!(result
+            .iter()
+            .any(|e| e.symbol == "makeApi" && e.entrypoint_type == EntrypointType::HttpRoute));
+    }
+
+    #[test]
+    fn test_detect_effect_http_api_group() {
+        let mut file = make_file("src/api/group.ts", Language::TypeScript);
+        file.imports = vec![make_import("@effect/platform/HttpApiGroup")];
+        file.call_sites = vec![make_call("HttpApiGroup.make", Some("usersGroup"))];
+        let result = detect_entrypoints(&[file]);
+        assert!(result
+            .iter()
+            .any(|e| e.symbol == "usersGroup" && e.entrypoint_type == EntrypointType::HttpRoute));
+    }
+
+    #[test]
+    fn test_detect_effect_http_router() {
+        let mut file = make_file("src/router.ts", Language::TypeScript);
+        file.imports = vec![make_import_with_names(
+            "@effect/platform",
+            vec!["HttpRouter"],
+        )];
+        file.call_sites = vec![
+            make_call("HttpRouter.get", Some("getHandler")),
+            make_call("HttpRouter.post", Some("postHandler")),
+        ];
+        let result = detect_entrypoints(&[file]);
+        let http: Vec<_> = result
+            .iter()
+            .filter(|e| e.entrypoint_type == EntrypointType::HttpRoute)
+            .collect();
+        assert_eq!(http.len(), 2);
+        assert!(http.iter().any(|e| e.symbol == "getHandler"));
+        assert!(http.iter().any(|e| e.symbol == "postHandler"));
+    }
+
+    #[test]
+    fn test_detect_effect_http_subpath_import() {
+        let mut file = make_file("src/api/endpoint.ts", Language::TypeScript);
+        file.imports = vec![make_import("@effect/platform/HttpApiEndpoint")];
+        file.call_sites = vec![make_call("HttpApiEndpoint.put", Some("updateUser"))];
+        let result = detect_entrypoints(&[file]);
+        assert!(result
+            .iter()
+            .any(|e| e.symbol == "updateUser" && e.entrypoint_type == EntrypointType::HttpRoute));
+    }
+
+    #[test]
+    fn test_no_effect_http_without_import() {
+        let mut file = make_file("src/api/users.ts", Language::TypeScript);
+        file.call_sites = vec![make_call("HttpApiEndpoint.get", Some("getUser"))];
+        let result = detect_entrypoints(&[file]);
+        assert!(result
+            .iter()
+            .all(|e| e.entrypoint_type != EntrypointType::HttpRoute));
+    }
+
+    // ========================================================================
+    // Effect.ts CLI command detection
+    // ========================================================================
+
+    #[test]
+    fn test_detect_effect_cli_command_make() {
+        let mut file = make_file("src/cli/main.ts", Language::TypeScript);
+        file.imports = vec![make_import_with_names(
+            "@effect/cli",
+            vec!["Command", "Args"],
+        )];
+        file.call_sites = vec![make_call("Command.make", Some("myCommand"))];
+        let result = detect_entrypoints(&[file]);
+        assert!(result
+            .iter()
+            .any(|e| e.symbol == "myCommand" && e.entrypoint_type == EntrypointType::CliCommand));
+    }
+
+    #[test]
+    fn test_detect_effect_cli_command_run() {
+        let mut file = make_file("src/cli.ts", Language::TypeScript);
+        file.imports = vec![make_import("@effect/cli/Command")];
+        file.call_sites = vec![make_call("Command.run", Some("runCli"))];
+        let result = detect_entrypoints(&[file]);
+        assert!(result
+            .iter()
+            .any(|e| e.symbol == "runCli" && e.entrypoint_type == EntrypointType::CliCommand));
+    }
+
+    #[test]
+    fn test_no_effect_cli_without_import() {
+        let mut file = make_file("src/cli.ts", Language::TypeScript);
+        file.call_sites = vec![make_call("Command.make", Some("myCmd"))];
+        let result = detect_entrypoints(&[file]);
+        // Without @effect/cli import, should not detect via Effect.ts CLI path
+        // (may detect via other paths if path matches cli patterns)
+        assert!(result
+            .iter()
+            .all(|e| e.symbol != "myCmd" || e.entrypoint_type != EntrypointType::CliCommand));
+    }
+
+    // ========================================================================
+    // Effect.ts queue consumer detection
+    // ========================================================================
+
+    #[test]
+    fn test_detect_effect_queue_take() {
+        let mut file = make_file("src/workers/processor.ts", Language::TypeScript);
+        file.imports = vec![make_import_with_names("effect", vec!["Queue"])];
+        file.call_sites = vec![make_call("Queue.take", Some("processMessages"))];
+        let result = detect_entrypoints(&[file]);
+        assert!(result
+            .iter()
+            .any(|e| e.symbol == "processMessages"
+                && e.entrypoint_type == EntrypointType::QueueConsumer));
+    }
+
+    #[test]
+    fn test_detect_effect_pubsub_subscribe() {
+        let mut file = make_file("src/events/subscriber.ts", Language::TypeScript);
+        file.imports = vec![make_import_with_names("effect", vec!["PubSub"])];
+        file.call_sites = vec![make_call("PubSub.subscribe", Some("handleEvents"))];
+        let result = detect_entrypoints(&[file]);
+        assert!(result
+            .iter()
+            .any(|e| e.symbol == "handleEvents"
+                && e.entrypoint_type == EntrypointType::QueueConsumer));
+    }
+
+    #[test]
+    fn test_detect_effect_queue_subpath_import() {
+        let mut file = make_file("src/worker.ts", Language::TypeScript);
+        file.imports = vec![make_import("effect/Queue")];
+        file.call_sites = vec![make_call("Queue.dequeue", Some("drain"))];
+        let result = detect_entrypoints(&[file]);
+        assert!(result
+            .iter()
+            .any(|e| e.symbol == "drain" && e.entrypoint_type == EntrypointType::QueueConsumer));
+    }
+
+    // ========================================================================
+    // Effect.ts cron job detection
+    // ========================================================================
+
+    #[test]
+    fn test_detect_effect_schedule_cron() {
+        let mut file = make_file("src/cron/cleanup.ts", Language::TypeScript);
+        file.imports = vec![make_import_with_names("effect", vec!["Schedule"])];
+        file.call_sites = vec![make_call("Schedule.cron", Some("dailyCleanup"))];
+        let result = detect_entrypoints(&[file]);
+        assert!(result
+            .iter()
+            .any(|e| e.symbol == "dailyCleanup" && e.entrypoint_type == EntrypointType::CronJob));
+    }
+
+    #[test]
+    fn test_detect_effect_schedule_spaced() {
+        let mut file = make_file("src/scheduler.ts", Language::TypeScript);
+        file.imports = vec![make_import("effect/Schedule")];
+        file.call_sites = vec![make_call("Schedule.spaced", Some("heartbeat"))];
+        let result = detect_entrypoints(&[file]);
+        assert!(result
+            .iter()
+            .any(|e| e.symbol == "heartbeat" && e.entrypoint_type == EntrypointType::CronJob));
+    }
+
+    #[test]
+    fn test_detect_effect_cron_make() {
+        let mut file = make_file("src/cron.ts", Language::TypeScript);
+        file.imports = vec![make_import("@effect/cron")];
+        file.call_sites = vec![make_call("Cron.make", Some("setupCron"))];
+        let result = detect_entrypoints(&[file]);
+        assert!(result
+            .iter()
+            .any(|e| e.symbol == "setupCron" && e.entrypoint_type == EntrypointType::CronJob));
+    }
+
+    #[test]
+    fn test_no_effect_cron_without_import() {
+        let mut file = make_file("src/utils.ts", Language::TypeScript);
+        file.call_sites = vec![make_call("Schedule.cron", Some("nope"))];
+        let result = detect_entrypoints(&[file]);
+        assert!(result
+            .iter()
+            .all(|e| e.entrypoint_type != EntrypointType::CronJob));
+    }
+
+    // ========================================================================
+    // Effect.ts test file detection
+    // ========================================================================
+
+    #[test]
+    fn test_detect_effect_vitest_it_effect() {
+        let mut file = make_file("src/services/auth.test.ts", Language::TypeScript);
+        file.imports = vec![make_import("@effect/vitest")];
+        file.call_sites = vec![make_call("it.effect", Some("describe"))];
+        let result = detect_entrypoints(&[file]);
+        // Should be detected via both test path and Effect.ts vitest
+        assert!(result
+            .iter()
+            .any(|e| e.entrypoint_type == EntrypointType::TestFile));
+    }
+
+    #[test]
+    fn test_detect_effect_vitest_it_scoped() {
+        let mut file = make_file("src/services/db.test.ts", Language::TypeScript);
+        file.imports = vec![make_import("@effect/vitest")];
+        file.call_sites = vec![make_call("it.scoped", Some("dbTests"))];
+        let result = detect_entrypoints(&[file]);
+        assert!(result
+            .iter()
+            .any(|e| e.entrypoint_type == EntrypointType::TestFile));
+    }
+
+    #[test]
+    fn test_detect_effect_vitest_it_live() {
+        let mut file = make_file("test/integration.test.ts", Language::TypeScript);
+        file.imports = vec![make_import("@effect/vitest")];
+        file.call_sites = vec![make_call("it.live", Some("liveTest"))];
+        let result = detect_entrypoints(&[file]);
+        assert!(result
+            .iter()
+            .any(|e| e.entrypoint_type == EntrypointType::TestFile));
+    }
+
+    // ========================================================================
+    // Effect.ts event handler detection
+    // ========================================================================
+
+    #[test]
+    fn test_detect_effect_stream_run() {
+        let mut file = make_file("src/streams/processor.ts", Language::TypeScript);
+        file.imports = vec![make_import_with_names("effect", vec!["Stream"])];
+        file.call_sites = vec![make_call("Stream.runForEach", Some("processStream"))];
+        let result = detect_entrypoints(&[file]);
+        assert!(result
+            .iter()
+            .any(|e| e.symbol == "processStream"
+                && e.entrypoint_type == EntrypointType::EventHandler));
+    }
+
+    #[test]
+    fn test_detect_effect_hub_subscribe() {
+        let mut file = make_file("src/events/hub.ts", Language::TypeScript);
+        file.imports = vec![make_import_with_names("effect", vec!["Hub"])];
+        file.call_sites = vec![make_call("Hub.subscribe", Some("listenForEvents"))];
+        let result = detect_entrypoints(&[file]);
+        assert!(result
+            .iter()
+            .any(|e| e.symbol == "listenForEvents"
+                && e.entrypoint_type == EntrypointType::EventHandler));
+    }
+
+    #[test]
+    fn test_detect_effect_stream_subpath_import() {
+        let mut file = make_file("src/stream.ts", Language::TypeScript);
+        file.imports = vec![make_import("effect/Stream")];
+        file.call_sites = vec![make_call("Stream.runDrain", Some("drainEvents"))];
+        let result = detect_entrypoints(&[file]);
+        assert!(result.iter().any(
+            |e| e.symbol == "drainEvents" && e.entrypoint_type == EntrypointType::EventHandler
+        ));
+    }
+
+    #[test]
+    fn test_no_effect_event_without_import() {
+        let mut file = make_file("src/stream.ts", Language::TypeScript);
+        file.call_sites = vec![make_call("Stream.run", Some("noImport"))];
+        let result = detect_entrypoints(&[file]);
+        assert!(result
+            .iter()
+            .all(|e| e.entrypoint_type != EntrypointType::EventHandler));
+    }
+
+    // ========================================================================
+    // Effect.ts service detection
+    // ========================================================================
+
+    #[test]
+    fn test_detect_effect_service() {
+        let mut file = make_file("src/services/user.ts", Language::TypeScript);
+        file.imports = vec![make_import_with_names("effect", vec!["Effect", "Context"])];
+        file.call_sites = vec![make_call("Effect.Service", Some("UserService"))];
+        let result = detect_entrypoints(&[file]);
+        assert!(result.iter().any(
+            |e| e.symbol == "UserService" && e.entrypoint_type == EntrypointType::EffectService
+        ));
+    }
+
+    #[test]
+    fn test_detect_context_tag() {
+        let mut file = make_file("src/services/db.ts", Language::TypeScript);
+        file.imports = vec![make_import_with_names("effect", vec!["Context"])];
+        file.call_sites = vec![make_call("Context.Tag", Some("DatabaseService"))];
+        let result = detect_entrypoints(&[file]);
+        assert!(result
+            .iter()
+            .any(|e| e.symbol == "DatabaseService"
+                && e.entrypoint_type == EntrypointType::EffectService));
+    }
+
+    #[test]
+    fn test_detect_context_generic_tag() {
+        let mut file = make_file("src/services/config.ts", Language::TypeScript);
+        file.imports = vec![make_import("effect/Context")];
+        file.call_sites = vec![make_call("Context.GenericTag", Some("ConfigService"))];
+        let result = detect_entrypoints(&[file]);
+        assert!(result
+            .iter()
+            .any(|e| e.symbol == "ConfigService"
+                && e.entrypoint_type == EntrypointType::EffectService));
+    }
+
+    #[test]
+    fn test_detect_layer_succeed() {
+        let mut file = make_file("src/layers/live.ts", Language::TypeScript);
+        file.imports = vec![make_import_with_names("effect", vec!["Layer"])];
+        file.call_sites = vec![make_call("Layer.succeed", Some("LiveLayer"))];
+        let result = detect_entrypoints(&[file]);
+        assert!(
+            result
+                .iter()
+                .any(|e| e.symbol == "LiveLayer"
+                    && e.entrypoint_type == EntrypointType::EffectService)
+        );
+    }
+
+    #[test]
+    fn test_detect_layer_effect() {
+        let mut file = make_file("src/layers/db.ts", Language::TypeScript);
+        file.imports = vec![make_import("effect/Layer")];
+        file.call_sites = vec![make_call("Layer.effect", Some("DbLayer"))];
+        let result = detect_entrypoints(&[file]);
+        assert!(result
+            .iter()
+            .any(|e| e.symbol == "DbLayer" && e.entrypoint_type == EntrypointType::EffectService));
+    }
+
+    #[test]
+    fn test_detect_layer_scoped() {
+        let mut file = make_file("src/layers/connection.ts", Language::TypeScript);
+        file.imports = vec![make_import_with_names("effect", vec!["Layer", "Effect"])];
+        file.call_sites = vec![make_call("Layer.scoped", Some("ConnectionLayer"))];
+        let result = detect_entrypoints(&[file]);
+        assert!(result
+            .iter()
+            .any(|e| e.symbol == "ConnectionLayer"
+                && e.entrypoint_type == EntrypointType::EffectService));
+    }
+
+    #[test]
+    fn test_no_effect_service_without_import() {
+        let mut file = make_file("src/services/user.ts", Language::TypeScript);
+        file.call_sites = vec![make_call("Effect.Service", Some("UserService"))];
+        let result = detect_entrypoints(&[file]);
+        assert!(result
+            .iter()
+            .all(|e| e.entrypoint_type != EntrypointType::EffectService));
+    }
+
+    // ========================================================================
+    // Effect.ts edge cases
+    // ========================================================================
+
+    #[test]
+    fn test_effect_ts_python_file_ignored() {
+        let mut file = make_file("src/services/user.py", Language::Python);
+        file.imports = vec![make_import_with_names("effect", vec!["Effect"])];
+        file.call_sites = vec![make_call("Effect.Service", Some("UserService"))];
+        let result = detect_entrypoints(&[file]);
+        assert!(result
+            .iter()
+            .all(|e| e.entrypoint_type != EntrypointType::EffectService));
+    }
+
+    #[test]
+    fn test_effect_multiple_entrypoint_types() {
+        let mut file = make_file("src/api/server.ts", Language::TypeScript);
+        file.imports = vec![
+            make_import_with_names("@effect/platform", vec!["HttpApiEndpoint"]),
+            make_import_with_names("effect", vec!["Effect", "Layer"]),
+        ];
+        file.call_sites = vec![
+            make_call("HttpApiEndpoint.get", Some("getEndpoint")),
+            make_call("Layer.succeed", Some("ApiLayer")),
+        ];
+        let result = detect_entrypoints(&[file]);
+        assert!(result
+            .iter()
+            .any(|e| e.entrypoint_type == EntrypointType::HttpRoute));
+        assert!(result
+            .iter()
+            .any(|e| e.entrypoint_type == EntrypointType::EffectService));
+    }
+
+    #[test]
+    fn test_effect_platform_node_import() {
+        let mut file = make_file("src/server.ts", Language::TypeScript);
+        file.imports = vec![make_import_with_names(
+            "@effect/platform-node",
+            vec!["HttpServer"],
+        )];
+        file.call_sites = vec![make_call("HttpRouter.get", Some("serveApp"))];
+        let result = detect_entrypoints(&[file]);
+        assert!(result
+            .iter()
+            .any(|e| e.symbol == "serveApp" && e.entrypoint_type == EntrypointType::HttpRoute));
+    }
+
+    #[test]
+    fn test_effect_deduplication_with_regular_detection() {
+        // A file detected as test by both path-based and Effect.ts vitest detection
+        let mut file = make_file("src/auth.test.ts", Language::TypeScript);
+        file.imports = vec![make_import("@effect/vitest")];
+        file.call_sites = vec![make_call("it.effect", Some("describe"))];
+        let result = detect_entrypoints(&[file]);
+        // Should deduplicate — same (file, symbol) pair
+        let test_entries: Vec<_> = result
+            .iter()
+            .filter(|e| e.file == "src/auth.test.ts" && e.symbol == "describe")
+            .collect();
+        assert_eq!(test_entries.len(), 1);
+    }
+
+    // ========================================================================
+    // Edge cases (existing + extended)
+    // ========================================================================
+
+    #[test]
+    fn test_unknown_language_no_entrypoints() {
+        let file = make_file("main.go", Language::Unknown);
+        let result = detect_entrypoints(&[file]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_file_stem_extraction() {
+        assert_eq!(file_stem("src/utils/format.ts"), "format");
+        assert_eq!(file_stem("main.py"), "main");
+        assert_eq!(file_stem("Makefile"), "Makefile");
+    }
+
+    // ========================================================================
+    // Path detection helpers
+    // ========================================================================
+
+    #[test]
+    fn test_is_test_path_variants() {
+        assert!(is_test_path("src/utils.test.ts"));
+        assert!(is_test_path("src/utils.spec.js"));
+        assert!(is_test_path("__tests__/App.test.tsx"));
+        assert!(is_test_path("tests/test_utils.py"));
+        assert!(is_test_path("test/integration.py"));
+        assert!(is_test_path("src/auth_test.py"));
+        assert!(!is_test_path("src/utils.ts"));
+        assert!(!is_test_path("src/testing-utils.ts"));
+    }
+
+    #[test]
+    fn test_is_nextjs_route_file() {
+        assert!(is_nextjs_route_file("src/app/api/users/route.ts"));
+        assert!(is_nextjs_route_file("app/api/route.ts"));
+        assert!(!is_nextjs_route_file("src/app/api/users/page.ts"));
+        assert!(!is_nextjs_route_file("src/routes/users.ts"));
+    }
+
+    #[test]
+    fn test_is_worker_path() {
+        assert!(is_worker_path("src/workers/email.ts"));
+        assert!(is_worker_path("src/jobs/cleanup.py"));
+        assert!(is_worker_path("src/email_worker.ts"));
+        assert!(!is_worker_path("src/services/email.ts"));
+    }
+
+    // =======================================================================
+    // IR-based entrypoint parity tests
+    // =======================================================================
+
+    mod ir_parity {
+        use super::*;
+        use crate::ast;
+        use crate::ir::IrFile;
+
+        /// Helper: detect entrypoints via both paths and compare.
+        fn detect_both(files: &[(&str, &str)]) -> (Vec<Entrypoint>, Vec<Entrypoint>) {
+            let parsed: Vec<ParsedFile> = files
+                .iter()
+                .map(|(path, source)| ast::parse_file(path, source).unwrap())
+                .collect();
+            let ir_files: Vec<IrFile> = parsed.iter().map(IrFile::from_parsed_file).collect();
+
+            let from_parsed = detect_entrypoints(&parsed);
+            let from_ir = detect_entrypoints_ir(&ir_files);
+            (from_parsed, from_ir)
+        }
+
+        #[test]
+        fn test_ir_parity_test_file() {
+            let (ep, ei) = detect_both(&[(
+                "src/utils.test.ts",
+                r#"
+function test_validate() {}
+function test_sanitize() {}
+"#,
+            )]);
+
+            assert_eq!(ep.len(), ei.len(), "entrypoint count should match");
+            for (a, b) in ep.iter().zip(ei.iter()) {
+                assert_eq!(a.file, b.file);
+                assert_eq!(a.symbol, b.symbol);
+                assert_eq!(a.entrypoint_type, b.entrypoint_type);
+            }
+        }
+
+        #[test]
+        fn test_ir_parity_express_route() {
+            let (ep, ei) = detect_both(&[(
+                "src/routes/users.ts",
+                r#"
+import express from 'express';
+const router = express.Router();
+function getUsers() {}
+router.get('/users', getUsers);
+"#,
+            )]);
+
+            assert_eq!(
+                ep.len(),
+                ei.len(),
+                "Express route entrypoint count should match"
+            );
+            for (a, b) in ep.iter().zip(ei.iter()) {
+                assert_eq!(a.file, b.file);
+                assert_eq!(a.entrypoint_type, b.entrypoint_type);
+            }
+        }
+
+        #[test]
+        fn test_ir_parity_flask_route() {
+            let (ep, ei) = detect_both(&[(
+                "app/views.py",
+                r#"
+from flask import Flask
+app = Flask(__name__)
+
+def list_users():
+    pass
+app.route('/users')(list_users)
+"#,
+            )]);
+
+            assert_eq!(ep.len(), ei.len());
+        }
+
+        #[test]
+        fn test_ir_parity_nextjs_route() {
+            let (ep, ei) = detect_both(&[(
+                "src/app/api/users/route.ts",
+                r#"
+export function GET(request: Request) {
+    return Response.json({});
+}
+export function POST(request: Request) {
+    return Response.json({});
+}
+"#,
+            )]);
+
+            assert_eq!(
+                ep.len(),
+                ei.len(),
+                "Next.js route entrypoint count should match"
+            );
+            for (a, b) in ep.iter().zip(ei.iter()) {
+                assert_eq!(a.file, b.file);
+                assert_eq!(a.symbol, b.symbol);
+            }
+        }
+
+        #[test]
+        fn test_ir_parity_cli_command() {
+            let (ep, ei) = detect_both(&[(
+                "src/cli.py",
+                r#"
+import click
+
+def main():
+    pass
+
+click.command()(main)
+"#,
+            )]);
+
+            assert_eq!(ep.len(), ei.len());
+        }
+
+        #[test]
+        fn test_ir_parity_no_entrypoints() {
+            let (ep, ei) = detect_both(&[(
+                "src/utils.ts",
+                r#"
+export function validate(data: any) { return data; }
+export function sanitize(data: any) { return data; }
+"#,
+            )]);
+
+            assert_eq!(ep.len(), ei.len(), "no entrypoints should be found");
+            assert!(ep.is_empty());
+        }
+
+        #[test]
+        fn test_ir_parity_multiple_files() {
+            let (ep, ei) = detect_both(&[
+                (
+                    "src/app/api/users/route.ts",
+                    r#"
+export function GET() { return Response.json([]); }
+"#,
+                ),
+                (
+                    "src/utils.test.ts",
+                    r#"
+function test_something() {}
+"#,
+                ),
+                (
+                    "src/services/user.ts",
+                    r#"
+export function createUser(data: any) {}
+"#,
+                ),
+            ]);
+
+            assert_eq!(
+                ep.len(),
+                ei.len(),
+                "multi-file entrypoint count should match"
+            );
+            for (a, b) in ep.iter().zip(ei.iter()) {
+                assert_eq!(a.file, b.file);
+                assert_eq!(a.symbol, b.symbol);
+                assert_eq!(a.entrypoint_type, b.entrypoint_type);
+            }
+        }
+
+        #[test]
+        fn test_ir_parity_empty() {
+            let from_parsed = detect_entrypoints(&[]);
+            let from_ir = detect_entrypoints_ir(&[]);
+            assert_eq!(from_parsed.len(), from_ir.len());
+            assert!(from_ir.is_empty());
+        }
+
+        #[test]
+        fn test_ir_parity_effect_ts_service() {
+            let (ep, ei) = detect_both(&[(
+                "src/services/user.ts",
+                r#"
+import { Effect, Context } from 'effect';
+function UserService() {}
+Effect.Service(UserService);
+"#,
+            )]);
+
+            assert_eq!(ep.len(), ei.len());
+        }
+
+        #[test]
+        fn test_ir_parity_queue_consumer() {
+            let (ep, ei) = detect_both(&[(
+                "src/workers/email.ts",
+                r#"
+import { Queue } from 'bullmq';
+function processEmail() {}
+queue.process(processEmail);
+"#,
+            )]);
+
+            assert_eq!(ep.len(), ei.len());
+        }
+    }
+
+    // ========================================================================
+    // Phase 3: Path-based entrypoint detection (spec §1.4)
+    // ========================================================================
+
+    #[test]
+    fn test_ts_routes_dir_with_express() {
+        let mut file = make_file("src/routes/users.ts", Language::TypeScript);
+        file.imports = vec![make_import("express")];
+        file.definitions = vec![make_def("getUsers", SymbolKind::Function)];
+        let result = detect_entrypoints(&[file]);
+        assert!(
+            result
+                .iter()
+                .any(|e| e.entrypoint_type == EntrypointType::HttpRoute),
+            "TS file in /routes/ with express import should be detected as HTTP entrypoint"
+        );
+    }
+
+    #[test]
+    fn test_ts_routes_dir_no_import_strong_path() {
+        let mut file = make_file("src/routes/users.ts", Language::TypeScript);
+        // No framework import — but /routes/ is a strong path signal
+        file.definitions = vec![make_def("getUsers", SymbolKind::Function)];
+        file.exports = vec![make_export("getUsers", false)];
+        let result = detect_entrypoints(&[file]);
+        assert!(
+            result
+                .iter()
+                .any(|e| e.entrypoint_type == EntrypointType::HttpRoute),
+            "TS file in /routes/ should be detected as entrypoint (strong path)"
+        );
+    }
+
+    #[test]
+    fn test_ts_controller_suffix_nestjs() {
+        let mut file = make_file("src/billing.controller.ts", Language::TypeScript);
+        file.imports = vec![make_import("@nestjs/common")];
+        file.definitions = vec![make_def("create", SymbolKind::Function)];
+        let result = detect_entrypoints(&[file]);
+        assert!(
+            result
+                .iter()
+                .any(|e| e.entrypoint_type == EntrypointType::HttpRoute),
+            "*.controller.ts with @nestjs/common import should be detected"
+        );
+    }
+
+    #[test]
+    fn test_ts_controller_suffix_strong_path() {
+        let mut file = make_file("src/billing.controller.ts", Language::TypeScript);
+        // No import — strong path (controller suffix)
+        file.definitions = vec![make_def("create", SymbolKind::Function)];
+        file.exports = vec![make_export("create", false)];
+        let result = detect_entrypoints(&[file]);
+        assert!(
+            result
+                .iter()
+                .any(|e| e.entrypoint_type == EntrypointType::HttpRoute),
+            "*.controller.ts should be detected as entrypoint (strong path)"
+        );
+    }
+
+    #[test]
+    fn test_ts_entrypoints_in_name() {
+        let mut file = make_file("src/command-entrypoints.ts", Language::TypeScript);
+        file.definitions = vec![make_def("deploy", SymbolKind::Function)];
+        file.exports = vec![make_export("deploy", false)];
+        let result = detect_entrypoints(&[file]);
+        assert!(
+            !result.is_empty(),
+            "File with 'entrypoints' in name should be detected (strong path)"
+        );
+    }
+
+    #[test]
+    fn test_go_handlers_dir() {
+        let mut file = make_file("internal/handlers/auth.go", Language::Go);
+        file.imports = vec![make_import("net/http")];
+        file.definitions = vec![make_def("HandleAuth", SymbolKind::Function)];
+        let result = detect_entrypoints(&[file]);
+        assert!(
+            result
+                .iter()
+                .any(|e| e.entrypoint_type == EntrypointType::HttpRoute),
+            "Go file in /handlers/ with net/http import should be detected"
+        );
+    }
+
+    #[test]
+    fn test_python_views_flask() {
+        let mut file = make_file("app/views/dashboard.py", Language::Python);
+        file.imports = vec![make_import("flask")];
+        file.definitions = vec![make_def("index", SymbolKind::Function)];
+        let result = detect_entrypoints(&[file]);
+        assert!(
+            result
+                .iter()
+                .any(|e| e.entrypoint_type == EntrypointType::HttpRoute),
+            "Python file in /views/ with flask import should be detected"
+        );
+    }
+
+    #[test]
+    fn test_java_controller_spring() {
+        let mut file = make_file("com/api/controllers/UserController.java", Language::Java);
+        file.imports = vec![make_import(
+            "org.springframework.web.bind.annotation.RestController",
+        )];
+        file.definitions = vec![make_def("getUser", SymbolKind::Function)];
+        let result = detect_entrypoints(&[file]);
+        assert!(
+            result
+                .iter()
+                .any(|e| e.entrypoint_type == EntrypointType::HttpRoute),
+            "Java controller in /controllers/ with Spring import should be detected"
+        );
+    }
+
+    #[test]
+    fn test_rust_handlers_axum() {
+        let mut file = make_file("src/handlers/auth.rs", Language::Rust);
+        file.imports = vec![make_import("axum")];
+        file.definitions = vec![make_def("login", SymbolKind::Function)];
+        let result = detect_entrypoints(&[file]);
+        assert!(
+            result
+                .iter()
+                .any(|e| e.entrypoint_type == EntrypointType::HttpRoute),
+            "Rust file in /handlers/ with axum import should be detected"
+        );
+    }
+
+    #[test]
+    fn test_no_false_positive_utils() {
+        let mut file = make_file("src/utils/helpers.ts", Language::TypeScript);
+        file.definitions = vec![make_def("formatDate", SymbolKind::Function)];
+        let result = detect_entrypoints(&[file]);
+        assert!(
+            result.is_empty(),
+            "src/utils/helpers.ts should NOT be detected as entrypoint"
+        );
+    }
+
+    #[test]
+    fn test_no_false_positive_api_types() {
+        let mut file = make_file("src/api/types.ts", Language::TypeScript);
+        // No framework import, not a strong path
+        file.definitions = vec![make_def("UserType", SymbolKind::TypeAlias)];
+        let result = detect_entrypoints(&[file]);
+        assert!(
+            result.is_empty(),
+            "src/api/types.ts without framework import should NOT be detected"
+        );
+    }
+
+    #[test]
+    fn test_cli_commands_dir_with_commander() {
+        let mut file = make_file("src/commands/deploy.ts", Language::TypeScript);
+        file.imports = vec![make_import("commander")];
+        file.definitions = vec![make_def("deploy", SymbolKind::Function)];
+        let result = detect_entrypoints(&[file]);
+        assert!(
+            result
+                .iter()
+                .any(|e| e.entrypoint_type == EntrypointType::CliCommand),
+            "TS file in /commands/ with commander import should be detected as CLI"
+        );
+    }
+
+    #[test]
+    fn test_cli_commands_dir_strong_path() {
+        let mut file = make_file("src/commands/migrate.ts", Language::TypeScript);
+        file.definitions = vec![make_def("migrate", SymbolKind::Function)];
+        file.exports = vec![make_export("migrate", false)];
+        let result = detect_entrypoints(&[file]);
+        assert!(
+            !result.is_empty(),
+            "/commands/ dir should detect entrypoints (strong path)"
+        );
+    }
+
+    // ========================================================================
+    // Path helper unit tests
+    // ========================================================================
+
+    #[test]
+    fn test_is_route_handler_path() {
+        assert!(is_route_handler_path("src/routes/users.ts"));
+        assert!(is_route_handler_path("src/handlers/auth.go"));
+        assert!(is_route_handler_path("src/controllers/billing.ts"));
+        assert!(is_route_handler_path("src/endpoints/api.ts"));
+        assert!(is_route_handler_path("src/billing.controller.ts"));
+        assert!(is_route_handler_path("src/users.route.ts"));
+        assert!(!is_route_handler_path("src/utils/helpers.ts"));
+        assert!(!is_route_handler_path("src/models/user.ts"));
+    }
+
+    #[test]
+    fn test_is_strong_route_handler_path() {
+        assert!(is_strong_route_handler_path("src/routes/users.ts"));
+        assert!(is_strong_route_handler_path("src/handlers/auth.go"));
+        assert!(is_strong_route_handler_path("src/controllers/billing.ts"));
+        assert!(is_strong_route_handler_path("src/billing.controller.ts"));
+        assert!(is_strong_route_handler_path("src/command-entrypoints.ts"));
+        assert!(!is_strong_route_handler_path("src/utils/helpers.ts"));
+        assert!(!is_strong_route_handler_path("src/api/types.ts"));
+    }
+
+    #[test]
+    fn test_is_cli_command_path() {
+        assert!(is_cli_command_path("src/commands/deploy.ts"));
+        assert!(is_cli_command_path("src/cmd/run.go"));
+        assert!(is_cli_command_path("src/cli/main.ts"));
+        assert!(is_cli_command_path("src/deploy.command.ts"));
+        assert!(!is_cli_command_path("src/utils/helpers.ts"));
+    }
+
+    #[test]
+    fn test_framework_import_helpers() {
+        // JS web
+        assert!(is_js_web_framework_import(&make_import("express")));
+        assert!(is_js_web_framework_import(&make_import("@nestjs/common")));
+        assert!(is_js_web_framework_import(&make_import("hono")));
+        assert!(!is_js_web_framework_import(&make_import("lodash")));
+
+        // Go web
+        assert!(is_go_web_framework_import(&make_import("net/http")));
+        assert!(is_go_web_framework_import(&make_import(
+            "github.com/gin-gonic/gin"
+        )));
+        assert!(!is_go_web_framework_import(&make_import("fmt")));
+
+        // Rust web
+        assert!(is_rust_web_framework_import(&make_import("axum")));
+        assert!(is_rust_web_framework_import(&make_import("actix_web")));
+        assert!(!is_rust_web_framework_import(&make_import("serde")));
+
+        // Java web
+        assert!(is_java_web_framework_import(&make_import(
+            "org.springframework.web.bind.annotation.RestController"
+        )));
+        assert!(!is_java_web_framework_import(&make_import(
+            "java.util.List"
+        )));
+
+        // JS CLI
+        assert!(is_js_cli_framework_import(&make_import("commander")));
+        assert!(is_js_cli_framework_import(&make_import("yargs")));
+        assert!(is_js_cli_framework_import(&make_import("@effect/cli")));
+        assert!(!is_js_cli_framework_import(&make_import("express")));
+    }
+
+    // ===================================================================
+    // Property-based tests for path detection helpers (spec §1)
+    // ===================================================================
+
+    mod proptests_path {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            /// Strong route handler paths are always also regular route handler paths.
+            #[test]
+            fn prop_strong_route_implies_regular(
+                dir in prop_oneof![
+                    Just("routes"),
+                    Just("handlers"),
+                    Just("controllers"),
+                    Just("endpoints"),
+                ],
+                name in "[a-z]{3,10}",
+                ext in prop_oneof![Just(".ts"), Just(".js"), Just(".py"), Just(".go")],
+            ) {
+                let path = format!("src/{}/{}{}", dir, name, ext);
+                if is_strong_route_handler_path(&path) {
+                    prop_assert!(
+                        is_route_handler_path(&path),
+                        "strong path '{}' must also be a regular route path", path,
+                    );
+                }
+            }
+
+            /// Route handler path detection is case-insensitive.
+            #[test]
+            fn prop_route_handler_case_insensitive(
+                dir in prop_oneof![
+                    Just("routes"),
+                    Just("handlers"),
+                    Just("controllers"),
+                ],
+                name in "[a-z]{3,10}",
+            ) {
+                let lower = format!("src/{}/{}.ts", dir, name);
+                let upper = format!("SRC/{}/{}.TS", dir.to_uppercase(), name.to_uppercase());
+                prop_assert_eq!(
+                    is_route_handler_path(&lower),
+                    is_route_handler_path(&upper),
+                    "detection should be case-insensitive: '{}' vs '{}'", lower, upper,
+                );
+            }
+
+            /// Files in plain src/ directories (no route/handler/controller pattern) are not
+            /// detected as route handlers.
+            #[test]
+            fn prop_plain_src_not_route(name in "[a-z]{3,15}") {
+                let path = format!("src/{}.ts", name);
+                // Only assert when name doesn't accidentally contain a pattern keyword
+                prop_assume!(
+                    !name.contains("route") && !name.contains("handler")
+                    && !name.contains("controller") && !name.contains("endpoint")
+                    && !name.contains("entrypoint")
+                );
+                prop_assert!(
+                    !is_route_handler_path(&path),
+                    "'{}' should not be a route handler path", path,
+                );
+            }
+
+            /// CLI command path detection: files in /commands/ are always detected.
+            #[test]
+            fn prop_cli_commands_dir_always_detected(
+                name in "[a-z]{3,10}",
+                ext in prop_oneof![Just(".ts"), Just(".go"), Just(".py"), Just(".rs")],
+            ) {
+                let path = format!("src/commands/{}{}", name, ext);
+                prop_assert!(
+                    is_cli_command_path(&path),
+                    "'{}' should be a CLI command path", path,
+                );
+            }
+
+            /// CLI and route directory patterns don't overlap (commands/ is CLI, routes/ is HTTP).
+            #[test]
+            fn prop_cli_route_dirs_disjoint(name in "[a-z]{3,10}") {
+                let cli_path = format!("src/commands/{}.ts", name);
+                let route_path = format!("src/routes/{}.ts", name);
+
+                // Guard: name doesn't contain keywords from the other domain
+                prop_assume!(
+                    !name.contains("route") && !name.contains("handler")
+                    && !name.contains("controller") && !name.contains("endpoint")
+                );
+                prop_assume!(
+                    !name.contains("command") && !name.contains("cli")
+                );
+
+                prop_assert!(is_cli_command_path(&cli_path), "commands/ should be CLI");
+                prop_assert!(!is_route_handler_path(&cli_path), "commands/ should NOT be HTTP");
+                prop_assert!(is_route_handler_path(&route_path), "routes/ should be HTTP");
+                prop_assert!(!is_cli_command_path(&route_path), "routes/ should NOT be CLI");
+            }
+
+            /// has_filename_pattern requires dot delimiters — partial substring matches don't count.
+            #[test]
+            fn prop_filename_pattern_requires_dots(
+                prefix in "[a-z]{2,8}",
+                pattern in prop_oneof![
+                    Just("controller"),
+                    Just("route"),
+                    Just("handler"),
+                ],
+                ext in prop_oneof![Just(".ts"), Just(".js")],
+            ) {
+                // With dots: "prefix.pattern.ext" → should match
+                let dotted = format!("src/{}.{}{}", prefix, pattern, ext);
+                prop_assert!(
+                    has_filename_pattern(&dotted.to_lowercase(), pattern),
+                    "'{}' with dot-delimited pattern should match", dotted,
+                );
+
+                // Without dots: "prefixpatternext" → should NOT match
+                let no_dots = format!("src/{}{}{}", prefix, pattern, ext);
+                // Only assert if the concatenation doesn't accidentally create a dot pattern
+                if !no_dots.to_lowercase().contains(&format!(".{}.", pattern)) {
+                    prop_assert!(
+                        !has_filename_pattern(&no_dots.to_lowercase(), pattern),
+                        "'{}' without dot delimiters should not match", no_dots,
+                    );
+                }
+            }
+
+            /// is_route_handler_path is deterministic.
+            #[test]
+            fn prop_route_handler_deterministic(path in "[a-z/._]{1,50}") {
+                let r1 = is_route_handler_path(&path);
+                let r2 = is_route_handler_path(&path);
+                prop_assert_eq!(r1, r2);
+            }
+
+            /// is_cli_command_path is deterministic.
+            #[test]
+            fn prop_cli_command_deterministic(path in "[a-z/._]{1,50}") {
+                let r1 = is_cli_command_path(&path);
+                let r2 = is_cli_command_path(&path);
+                prop_assert_eq!(r1, r2);
+            }
+        }
+    }
+}

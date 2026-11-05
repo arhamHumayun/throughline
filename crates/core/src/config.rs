@@ -1,0 +1,1936 @@
+//! Configuration file support for `.diffcore.toml`.
+//!
+//! Parses the optional project configuration file and provides a unified
+//! `DiffcoreConfig` that merges defaults with file-provided overrides.
+//!
+//! See spec §6.2 for the full config file format.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+
+use crate::types::RankWeights;
+
+/// Complete diffcore configuration, merging defaults with `.diffcore.toml`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DiffcoreConfig {
+    /// Project metadata.
+    #[serde(default)]
+    pub project: ProjectConfig,
+    /// Declared entrypoint glob patterns.
+    #[serde(default)]
+    pub entrypoints: EntrypointConfig,
+    /// Named architectural layers mapped to glob patterns.
+    #[serde(default)]
+    pub layers: HashMap<String, String>,
+    /// File ignore patterns.
+    #[serde(default)]
+    pub ignore: IgnoreConfig,
+    /// LLM provider configuration.
+    #[serde(default)]
+    pub llm: LlmConfig,
+    /// Ranking weight overrides.
+    #[serde(default)]
+    pub ranking: RankWeights,
+    /// Diff behavior configuration.
+    #[serde(default)]
+    pub diff: DiffConfig,
+}
+
+impl Default for DiffcoreConfig {
+    fn default() -> Self {
+        Self {
+            project: ProjectConfig::default(),
+            entrypoints: EntrypointConfig::default(),
+            layers: HashMap::new(),
+            ignore: IgnoreConfig::default(),
+            llm: LlmConfig::default(),
+            ranking: RankWeights::default(),
+            diff: DiffConfig::default(),
+        }
+    }
+}
+
+/// Project metadata.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProjectConfig {
+    /// Project name (used in output metadata).
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+impl Default for ProjectConfig {
+    fn default() -> Self {
+        Self { name: None }
+    }
+}
+
+/// Declared entrypoint glob patterns by type.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct EntrypointConfig {
+    /// HTTP route handler globs.
+    #[serde(default)]
+    pub http: Vec<String>,
+    /// Background worker / queue consumer globs.
+    #[serde(default)]
+    pub workers: Vec<String>,
+    /// CLI command globs.
+    #[serde(default)]
+    pub cli: Vec<String>,
+    /// Cron job globs.
+    #[serde(default)]
+    pub cron: Vec<String>,
+    /// Event handler globs.
+    #[serde(default)]
+    pub events: Vec<String>,
+}
+
+/// File ignore configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct IgnoreConfig {
+    /// Glob patterns for files to exclude from analysis.
+    #[serde(default)]
+    pub paths: Vec<String>,
+    /// Whether to auto-detect git subtree imports and ignore their paths.
+    ///
+    /// When true (default), `apply_detected_subtrees` scans the repository's commit
+    /// history for `git subtree` merge markers and adds the imported paths to
+    /// `paths` as `<path>/**` globs. Vendored upstream code merged via
+    /// `git subtree add`/`pull` is filtered out automatically without manual config.
+    #[serde(default = "default_auto_subtrees")]
+    pub auto_subtrees: bool,
+}
+
+fn default_auto_subtrees() -> bool {
+    true
+}
+
+impl Default for IgnoreConfig {
+    fn default() -> Self {
+        Self {
+            paths: Vec::new(),
+            auto_subtrees: true,
+        }
+    }
+}
+
+/// Diff behavior configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DiffConfig {
+    /// When true, branch comparisons include uncommitted working tree changes.
+    /// Equivalent to `git diff <base>` instead of `git diff <base>..HEAD`.
+    #[serde(default = "default_include_uncommitted")]
+    pub include_uncommitted: bool,
+}
+
+fn default_include_uncommitted() -> bool {
+    true
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for DiffConfig {
+    fn default() -> Self {
+        Self {
+            include_uncommitted: true,
+        }
+    }
+}
+
+/// UI preferences, shared across the desktop app and the web build.
+///
+/// Deliberately its own file (`ui.toml`), not a section of `config.toml`.
+/// UI prefs are written on every theme toggle and panel resize; `config.toml`
+/// holds a plaintext API key and is written rarely. Sharing one
+/// read-modify-write file would mean a theme toggle could drop a credential
+/// written concurrently by another instance.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct UiConfig {
+    /// Theme mode.
+    #[serde(default)]
+    pub theme_mode: ThemeMode,
+    /// Theme id used when resolving to light.
+    #[serde(default = "default_theme_light")]
+    pub theme_light: String,
+    /// Theme id used when resolving to dark.
+    #[serde(default = "default_theme_dark")]
+    pub theme_dark: String,
+    /// Width of the right-hand panel in pixels.
+    #[serde(default = "default_right_panel_width")]
+    pub right_panel_width: u32,
+    /// Whether the right-hand panel is collapsed.
+    #[serde(default)]
+    pub right_panel_collapsed: bool,
+}
+
+/// How the active theme is chosen. An enum so serde rejects garbage at parse
+/// time instead of leaving the frontend to sanitise a free-form string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ThemeMode {
+    Light,
+    #[default]
+    Dark,
+    System,
+}
+
+fn default_theme_light() -> String {
+    "catppuccin-latte".to_string()
+}
+
+fn default_theme_dark() -> String {
+    "catppuccin-mocha".to_string()
+}
+
+fn default_right_panel_width() -> u32 {
+    320
+}
+
+/// Panel width bounds, mirroring the drag clamp in the UI. A width outside
+/// this range renders an unusable layout, so it is clamped on both read and
+/// write rather than trusted.
+const MIN_PANEL_WIDTH: u32 = 200;
+const MAX_PANEL_WIDTH: u32 = 800;
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        Self {
+            theme_mode: ThemeMode::default(),
+            theme_light: default_theme_light(),
+            theme_dark: default_theme_dark(),
+            right_panel_width: default_right_panel_width(),
+            right_panel_collapsed: false,
+        }
+    }
+}
+
+impl UiConfig {
+    /// Path to `ui.toml` in the XDG config dir.
+    pub fn path() -> Option<PathBuf> {
+        crate::paths::config_dir().map(|dir| dir.join("ui.toml"))
+    }
+
+    /// Load UI preferences, falling back to defaults.
+    ///
+    /// Never returns an error: a corrupt or hand-mangled prefs file must not
+    /// be able to take down the app, so it degrades to defaults.
+    pub fn load() -> Self {
+        let Some(path) = Self::path() else {
+            return Self::default();
+        };
+        let Ok(contents) = std::fs::read_to_string(&path) else {
+            return Self::default();
+        };
+        match toml::from_str::<Self>(&contents) {
+            Ok(mut config) => {
+                config.clamp();
+                config
+            }
+            Err(e) => {
+                tracing::warn!("ignoring unparseable {}: {e}", path.display());
+                Self::default()
+            }
+        }
+    }
+
+    /// Write UI preferences to `ui.toml`.
+    pub fn save(&self) -> Result<(), ConfigError> {
+        let Some(path) = Self::path() else {
+            return Err(ConfigError::Validation(
+                "Could not resolve a config directory for UI settings".to_string(),
+            ));
+        };
+        let mut config = self.clone();
+        config.clamp();
+        let toml_str = toml::to_string_pretty(&config).map_err(|e| {
+            ConfigError::Validation(format!("Failed to serialize UI settings: {}", e))
+        })?;
+        write_atomically(&path, &toml_str)
+    }
+
+    fn clamp(&mut self) {
+        self.right_panel_width = self
+            .right_panel_width
+            .clamp(MIN_PANEL_WIDTH, MAX_PANEL_WIDTH);
+    }
+}
+
+/// Write to a sibling temp file then rename, so a reader never observes a
+/// half-written file and a crash mid-write cannot truncate the old one.
+fn write_atomically(path: &Path, contents: &str) -> Result<(), ConfigError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, contents)?;
+    restrict_permissions(&tmp);
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// Owner-only permissions. `config.toml` carries a plaintext API key, and
+/// `fs::write` would otherwise create it 0644.
+fn restrict_permissions(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
+/// LLM provider configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LlmConfig {
+    /// Provider name: "anthropic" or "openai".
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// Model identifier.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Shell command to retrieve the API key (e.g. `op read op://vault/item/field`).
+    #[serde(default)]
+    pub key_cmd: Option<String>,
+    /// API key stored directly in the config file.
+    /// Precedence: key_cmd > key > env vars.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    /// Whether LLM annotations are enabled (default: true).
+    #[serde(default = "default_true")]
+    pub annotations_enabled: bool,
+    /// Optional LLM refinement pass configuration.
+    #[serde(default)]
+    pub refinement: RefinementConfig,
+    /// Optional LLM group metadata pass configuration.
+    #[serde(default)]
+    pub metadata: MetadataConfig,
+}
+
+/// Configuration for the optional LLM refinement pass.
+///
+/// The refinement pass takes deterministic groups (v1) and asks an LLM to improve them:
+/// split coincidental groupings, merge scattered refactors, re-rank by semantic review
+/// order, reclassify misplaced files. It is a single pass — the response is either
+/// applied or discarded, leaving the deterministic groups in place.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RefinementConfig {
+    /// Whether refinement is enabled (default: true).
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Provider for refinement (can differ from annotation provider).
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// Model for refinement (user-selectable).
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Shell command to retrieve the refinement API key.
+    #[serde(default)]
+    pub key_cmd: Option<String>,
+}
+
+impl Default for RefinementConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            provider: None,
+            model: None,
+            key_cmd: None,
+        }
+    }
+}
+
+/// Configuration for the optional LLM group metadata pass.
+///
+/// The metadata pass runs on the *final* groups — after refinement, if refinement
+/// ran — and fills in the review metadata a reviewer glances at: group type, risk
+/// band, impact scope, review complexity, review focus, a one-line description, and
+/// the invariant to verify. It never writes `risk_score`.
+///
+/// It gets its own provider/model because writing a one-line invariant is a much
+/// cheaper task than the structural reasoning refinement does.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MetadataConfig {
+    /// Whether the metadata pass is enabled (default: true).
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Provider for the metadata pass (can differ from the refinement provider).
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// Model for the metadata pass (user-selectable).
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Shell command to retrieve the metadata API key.
+    #[serde(default)]
+    pub key_cmd: Option<String>,
+    /// API key stored directly in the config file.
+    /// Precedence: key_cmd > key > env vars.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    /// Number of groups sent per LLM call (default: 20).
+    #[serde(default = "default_metadata_batch_size")]
+    pub batch_size: usize,
+}
+
+fn default_metadata_batch_size() -> usize {
+    20
+}
+
+impl Default for MetadataConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            provider: None,
+            model: None,
+            key_cmd: None,
+            key: None,
+            batch_size: default_metadata_batch_size(),
+        }
+    }
+}
+
+impl Default for LlmConfig {
+    fn default() -> Self {
+        Self {
+            provider: None,
+            model: None,
+            key_cmd: None,
+            key: None,
+            annotations_enabled: true,
+            refinement: RefinementConfig::default(),
+            metadata: MetadataConfig::default(),
+        }
+    }
+}
+
+/// Errors that can occur when loading configuration.
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigError {
+    #[error("Failed to read config file: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("Failed to parse config file: {0}")]
+    Parse(#[from] toml::de::Error),
+    #[error("Invalid config: {0}")]
+    Validation(String),
+}
+
+impl DiffcoreConfig {
+    /// Return the global diffcore config path, following XDG base directories.
+    ///
+    /// Resolution order: `DIFFCORE_CONFIG_HOME`, `XDG_CONFIG_HOME/diffcore`,
+    /// `HOME/.config/diffcore`. This is always where writes go; see
+    /// [`Self::load_global`] for the pre-XDG read fallback.
+    pub fn global_config_path() -> Option<PathBuf> {
+        crate::paths::config_dir().map(|dir| dir.join("config.toml"))
+    }
+
+    /// Pre-XDG global config (`~/.diffcore/config.toml`), read-only.
+    fn legacy_global_config_path() -> Option<PathBuf> {
+        crate::paths::legacy_dir().map(|dir| dir.join("config.toml"))
+    }
+
+    /// The global config file actually in use, or `None` when none exists yet.
+    ///
+    /// Resolution order matches [`Self::load_global`]: the XDG path, then the
+    /// pre-XDG `~/.diffcore/config.toml`. Callers displaying "your key lives
+    /// here" must use this, not [`Self::global_config_path`], which always
+    /// names the write target and so lies during the migration window.
+    pub fn global_config_source() -> Option<PathBuf> {
+        Self::global_config_path()
+            .filter(|path| path.exists())
+            .or_else(|| Self::legacy_global_config_path().filter(|path| path.exists()))
+    }
+
+    /// Whether settings are still being read from the pre-XDG location.
+    pub fn using_legacy_global_config() -> bool {
+        Self::global_config_path().is_none_or(|path| !path.exists())
+            && Self::legacy_global_config_path().is_some_and(|path| path.exists())
+    }
+
+    /// Load configuration from the user's global config file.
+    ///
+    /// Reads the XDG path when it exists, otherwise falls back to the pre-XDG
+    /// `~/.diffcore/config.toml` so existing installs keep their settings.
+    /// Returns defaults when neither is present.
+    pub fn load_global() -> Result<Self, ConfigError> {
+        match Self::global_config_source() {
+            Some(path) => Self::from_file(&path),
+            None => Ok(Self::default()),
+        }
+    }
+
+    /// Load configuration from a `.diffcore.toml` file at the given path.
+    ///
+    /// Returns `Ok(config)` with the parsed config, or `Err` on I/O or parse errors.
+    pub fn from_file(path: &Path) -> Result<Self, ConfigError> {
+        let contents = std::fs::read_to_string(path)?;
+        Self::from_str(&contents)
+    }
+
+    /// Parse configuration from a TOML string.
+    pub fn from_str(toml_str: &str) -> Result<Self, ConfigError> {
+        let config: DiffcoreConfig = toml::from_str(toml_str)?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Look for `.diffcore.toml` in the given directory (typically the repo root).
+    ///
+    /// Returns `Ok(default)` if the file doesn't exist, `Err` if the file exists but is invalid.
+    pub fn load_from_dir(dir: &Path) -> Result<Self, ConfigError> {
+        let config_path = dir.join(".diffcore.toml");
+        if config_path.exists() {
+            Self::from_file(&config_path)
+        } else {
+            Ok(Self::default())
+        }
+    }
+
+    /// Load repo-local config and merge in global LLM defaults from the global config.
+    ///
+    /// Repo-local project settings remain authoritative; only the `[llm]` section falls back
+    /// to the global config when values are not set locally.
+    pub fn load_with_global_llm_from_dir(dir: &Path) -> Result<Self, ConfigError> {
+        let mut local = Self::load_from_dir(dir)?;
+        let global = Self::load_global()?;
+        local.apply_global_llm_defaults(&global);
+        Ok(local)
+    }
+
+    /// Save configuration to the global diffcore config (always the XDG path).
+    pub fn save_global(&self) -> Result<(), ConfigError> {
+        let Some(config_path) = Self::global_config_path() else {
+            return Err(ConfigError::Validation(
+                "Could not resolve a home directory for global config".to_string(),
+            ));
+        };
+
+        let toml_str = toml::to_string_pretty(self)
+            .map_err(|e| ConfigError::Validation(format!("Failed to serialize config: {}", e)))?;
+        // Atomic + owner-only: this file holds a plaintext API key.
+        write_atomically(&config_path, &toml_str)
+    }
+
+    /// Validate the configuration for consistency.
+    fn validate(&self) -> Result<(), ConfigError> {
+        // Validate ranking weights are non-negative
+        if self.ranking.risk < 0.0
+            || self.ranking.centrality < 0.0
+            || self.ranking.surface_area < 0.0
+            || self.ranking.uncertainty < 0.0
+        {
+            return Err(ConfigError::Validation(
+                "Ranking weights must be non-negative".to_string(),
+            ));
+        }
+
+        // Validate LLM provider if specified
+        if let Some(ref provider) = self.llm.provider {
+            let valid = ["anthropic", "openai", "gemini", "codex", "claude"];
+            if !valid.contains(&provider.as_str()) {
+                return Err(ConfigError::Validation(format!(
+                    "Unknown LLM provider '{}'. Valid providers: {}",
+                    provider,
+                    valid.join(", ")
+                )));
+            }
+        }
+
+        // Validate refinement provider if specified
+        if let Some(ref provider) = self.llm.refinement.provider {
+            let valid = ["anthropic", "openai", "gemini", "codex", "claude"];
+            if !valid.contains(&provider.as_str()) {
+                return Err(ConfigError::Validation(format!(
+                    "Unknown refinement provider '{}'. Valid providers: {}",
+                    provider,
+                    valid.join(", ")
+                )));
+            }
+        }
+
+        // Validate metadata provider if specified
+        if let Some(ref provider) = self.llm.metadata.provider {
+            let valid = ["anthropic", "openai", "gemini", "codex", "claude"];
+            if !valid.contains(&provider.as_str()) {
+                return Err(ConfigError::Validation(format!(
+                    "Unknown metadata provider '{}'. Valid providers: {}",
+                    provider,
+                    valid.join(", ")
+                )));
+            }
+        }
+
+        // Validate batch_size is at least 1
+        if self.llm.metadata.batch_size == 0 {
+            return Err(ConfigError::Validation(
+                "Metadata batch_size must be at least 1".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Resolve entrypoint glob patterns against a base directory.
+    ///
+    /// Returns a flat list of file paths that match any declared entrypoint pattern.
+    pub fn resolve_entrypoint_globs(&self, base_dir: &Path) -> Vec<PathBuf> {
+        let all_patterns: Vec<&str> = self
+            .entrypoints
+            .http
+            .iter()
+            .chain(self.entrypoints.workers.iter())
+            .chain(self.entrypoints.cli.iter())
+            .chain(self.entrypoints.cron.iter())
+            .chain(self.entrypoints.events.iter())
+            .map(|s| s.as_str())
+            .collect();
+
+        let mut result = Vec::new();
+        for pattern in all_patterns {
+            let full_pattern = base_dir.join(pattern).to_string_lossy().to_string();
+            if let Ok(paths) = glob::glob(&full_pattern) {
+                for entry in paths.flatten() {
+                    result.push(entry);
+                }
+            }
+        }
+        result.sort();
+        result.dedup();
+        result
+    }
+
+    /// Save the configuration to `.diffcore.toml` in the given directory.
+    ///
+    /// If a `.diffcore.toml` already exists, it is overwritten.
+    pub fn save_to_dir(&self, dir: &Path) -> Result<(), ConfigError> {
+        let config_path = dir.join(".diffcore.toml");
+        let toml_str = toml::to_string_pretty(self)
+            .map_err(|e| ConfigError::Validation(format!("Failed to serialize config: {}", e)))?;
+        std::fs::write(&config_path, toml_str)?;
+        Ok(())
+    }
+
+    /// Detect git subtree imports and append `<path>/**` globs to the ignore list.
+    ///
+    /// No-op when `ignore.auto_subtrees` is false. Returns the list of paths that
+    /// were detected (so callers can surface them in logs/UI); pre-existing
+    /// ignore patterns are preserved and duplicates are skipped.
+    pub fn apply_detected_subtrees(&mut self, repo: &git2::Repository) -> Vec<String> {
+        if !self.ignore.auto_subtrees {
+            return Vec::new();
+        }
+        let detected = match crate::git::detect_subtree_paths(repo) {
+            Ok(paths) => paths,
+            Err(_) => return Vec::new(),
+        };
+        for path in &detected {
+            let pattern = format!("{}/**", path);
+            if !self.ignore.paths.contains(&pattern) {
+                self.ignore.paths.push(pattern);
+            }
+        }
+        detected
+    }
+
+    /// Check if a file path should be ignored based on configured ignore patterns.
+    ///
+    /// Patterns are matched against the relative path from the repo root.
+    pub fn is_ignored(&self, relative_path: &str) -> bool {
+        // Always exclude .diffcore/ directory (cache, comments, config)
+        if relative_path.starts_with(".diffcore/") || relative_path == ".diffcore" {
+            return true;
+        }
+        for pattern in &self.ignore.paths {
+            if let Ok(glob_pattern) = glob::Pattern::new(pattern) {
+                if glob_pattern.matches(relative_path) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Get the layer name for a file path, if it matches any configured layer pattern.
+    pub fn layer_for_path(&self, relative_path: &str) -> Option<String> {
+        for (layer_name, pattern) in &self.layers {
+            if let Ok(glob_pattern) = glob::Pattern::new(pattern) {
+                if glob_pattern.matches(relative_path) {
+                    return Some(layer_name.clone());
+                }
+            }
+        }
+        None
+    }
+
+    fn apply_global_llm_defaults(&mut self, global: &Self) {
+        self.llm.provider = self
+            .llm
+            .provider
+            .clone()
+            .or_else(|| global.llm.provider.clone());
+        self.llm.model = self.llm.model.clone().or_else(|| global.llm.model.clone());
+        self.llm.key_cmd = self
+            .llm
+            .key_cmd
+            .clone()
+            .or_else(|| global.llm.key_cmd.clone());
+        self.llm.key = self.llm.key.clone().or_else(|| global.llm.key.clone());
+
+        self.llm.refinement.enabled = self.llm.refinement.enabled || global.llm.refinement.enabled;
+        self.llm.refinement.provider = self
+            .llm
+            .refinement
+            .provider
+            .clone()
+            .or_else(|| global.llm.refinement.provider.clone());
+        self.llm.refinement.model = self
+            .llm
+            .refinement
+            .model
+            .clone()
+            .or_else(|| global.llm.refinement.model.clone());
+        self.llm.refinement.key_cmd = self
+            .llm
+            .refinement
+            .key_cmd
+            .clone()
+            .or_else(|| global.llm.refinement.key_cmd.clone());
+
+        self.llm.metadata.enabled = self.llm.metadata.enabled || global.llm.metadata.enabled;
+        self.llm.metadata.provider = self
+            .llm
+            .metadata
+            .provider
+            .clone()
+            .or_else(|| global.llm.metadata.provider.clone());
+        self.llm.metadata.model = self
+            .llm
+            .metadata
+            .model
+            .clone()
+            .or_else(|| global.llm.metadata.model.clone());
+        self.llm.metadata.key_cmd = self
+            .llm
+            .metadata
+            .key_cmd
+            .clone()
+            .or_else(|| global.llm.metadata.key_cmd.clone());
+        self.llm.metadata.key = self
+            .llm
+            .metadata
+            .key
+            .clone()
+            .or_else(|| global.llm.metadata.key.clone());
+        if self.llm.metadata.batch_size == default_metadata_batch_size() {
+            self.llm.metadata.batch_size = global.llm.metadata.batch_size;
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
+mod tests {
+    use super::*;
+
+    fn diffcore_config_home_for_testing(
+        override_home: Option<&Path>,
+        fallback_home: Option<&Path>,
+    ) -> Option<PathBuf> {
+        override_home
+            .map(PathBuf::from)
+            .or_else(|| fallback_home.map(|path| path.join(".diffcore")))
+    }
+
+    fn global_config_path_for_testing(
+        override_home: Option<&Path>,
+        fallback_home: Option<&Path>,
+    ) -> Option<PathBuf> {
+        diffcore_config_home_for_testing(override_home, fallback_home)
+            .map(|dir| dir.join("config.toml"))
+    }
+
+    // ── Spec §12.2 Config Layer Tests ──
+
+    #[test]
+    fn test_parse_valid_config() {
+        let toml_str = r#"
+[project]
+name = "my-app"
+
+[entrypoints]
+http = ["src/routes/**/*.ts"]
+workers = ["src/jobs/**/*.ts"]
+cli = ["src/cli/main.rs"]
+
+[layers]
+api = "src/handlers/**"
+domain = "src/services/**"
+persistence = "src/repositories/**"
+ui = "src/components/**"
+
+[ignore]
+paths = ["**/*.test.ts", "**/*.spec.ts", "migrations/**"]
+
+[llm]
+provider = "anthropic"
+model = "claude-sonnet-4-6"
+
+[ranking]
+risk = 0.4
+centrality = 0.3
+surface_area = 0.15
+uncertainty = 0.15
+"#;
+        let config = DiffcoreConfig::from_str(toml_str).unwrap();
+
+        assert_eq!(config.project.name, Some("my-app".to_string()));
+        assert_eq!(config.entrypoints.http, vec!["src/routes/**/*.ts"]);
+        assert_eq!(config.entrypoints.workers, vec!["src/jobs/**/*.ts"]);
+        assert_eq!(config.entrypoints.cli, vec!["src/cli/main.rs"]);
+        assert_eq!(config.layers.len(), 4);
+        assert_eq!(config.layers.get("api").unwrap(), "src/handlers/**");
+        assert_eq!(config.layers.get("domain").unwrap(), "src/services/**");
+        assert_eq!(
+            config.layers.get("persistence").unwrap(),
+            "src/repositories/**"
+        );
+        assert_eq!(config.layers.get("ui").unwrap(), "src/components/**");
+        assert_eq!(config.ignore.paths.len(), 3);
+        assert_eq!(config.llm.provider, Some("anthropic".to_string()));
+        assert_eq!(config.llm.model, Some("claude-sonnet-4-6".to_string()));
+        assert!((config.ranking.risk - 0.4).abs() < f64::EPSILON);
+        assert!((config.ranking.centrality - 0.3).abs() < f64::EPSILON);
+        assert!((config.ranking.surface_area - 0.15).abs() < f64::EPSILON);
+        assert!((config.ranking.uncertainty - 0.15).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_missing_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = DiffcoreConfig::load_from_dir(dir.path()).unwrap();
+        assert_eq!(config, DiffcoreConfig::default());
+    }
+
+    #[test]
+    fn test_global_config_path_prefers_env_override() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("config.toml");
+        assert_eq!(
+            diffcore_config_home_for_testing(Some(home.path()), None),
+            Some(home.path().to_path_buf())
+        );
+        assert_eq!(
+            global_config_path_for_testing(Some(home.path()), None),
+            Some(path)
+        );
+    }
+
+    #[test]
+    fn test_partial_config() {
+        // Config with only some sections — rest should use defaults
+        let toml_str = r#"
+[ranking]
+risk = 0.5
+centrality = 0.5
+surface_area = 0.0
+uncertainty = 0.0
+"#;
+        let config = DiffcoreConfig::from_str(toml_str).unwrap();
+
+        // Ranking overridden
+        assert!((config.ranking.risk - 0.5).abs() < f64::EPSILON);
+        assert!((config.ranking.centrality - 0.5).abs() < f64::EPSILON);
+        assert!((config.ranking.surface_area - 0.0).abs() < f64::EPSILON);
+        assert!((config.ranking.uncertainty - 0.0).abs() < f64::EPSILON);
+
+        // Rest is default
+        assert_eq!(config.project.name, None);
+        assert!(config.entrypoints.http.is_empty());
+        assert!(config.layers.is_empty());
+        assert!(config.ignore.paths.is_empty());
+        assert_eq!(config.llm.provider, None);
+    }
+
+    #[test]
+    fn test_load_with_global_llm_from_dir_uses_global_llm_defaults() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+
+        let global_path = global_config_path_for_testing(Some(home.path()), None).unwrap();
+        std::fs::create_dir_all(global_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &global_path,
+            r#"
+[llm]
+provider = "codex"
+model = "default"
+
+[llm.refinement]
+enabled = true
+provider = "claude"
+model = "default"
+"#,
+        )
+        .unwrap();
+
+        std::fs::write(
+            repo.path().join(".diffcore.toml"),
+            r#"
+[ignore]
+paths = ["dist/**"]
+"#,
+        )
+        .unwrap();
+
+        let local = DiffcoreConfig::load_from_dir(repo.path()).unwrap();
+        let global = DiffcoreConfig::from_file(&global_path).unwrap();
+        let mut merged = local.clone();
+        merged.apply_global_llm_defaults(&global);
+
+        assert_eq!(merged.ignore.paths, vec!["dist/**"]);
+        assert_eq!(merged.llm.provider, Some("codex".to_string()));
+        assert_eq!(merged.llm.model, Some("default".to_string()));
+        assert!(merged.llm.refinement.enabled);
+        assert_eq!(merged.llm.refinement.provider, Some("claude".to_string()));
+    }
+
+    #[test]
+    fn test_save_global_roundtrip_via_custom_home() {
+        let home = tempfile::tempdir().unwrap();
+        let path = global_config_path_for_testing(Some(home.path()), None).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        let mut config = DiffcoreConfig::default();
+        config.llm.provider = Some("claude".to_string());
+        config.llm.model = Some("default".to_string());
+
+        let toml_str = toml::to_string_pretty(&config).unwrap();
+        std::fs::write(&path, toml_str).unwrap();
+
+        let loaded = DiffcoreConfig::from_file(&path).unwrap();
+        assert_eq!(loaded.llm.provider, Some("claude".to_string()));
+        assert_eq!(loaded.llm.model, Some("default".to_string()));
+    }
+
+    #[test]
+    fn test_invalid_config() {
+        let toml_str = r#"
+[ranking
+risk = "not a number"
+"#;
+        let result = DiffcoreConfig::from_str(toml_str);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        match err {
+            ConfigError::Parse(_) => {} // Expected
+            _ => panic!("Expected parse error, got: {:?}", err),
+        }
+    }
+
+    #[test]
+    fn test_entrypoint_globs() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Create directory structure with matching files
+        let routes_dir = dir.path().join("src").join("routes");
+        std::fs::create_dir_all(&routes_dir).unwrap();
+        std::fs::write(routes_dir.join("users.ts"), "export default {}").unwrap();
+        std::fs::write(routes_dir.join("posts.ts"), "export default {}").unwrap();
+
+        let jobs_dir = dir.path().join("src").join("jobs");
+        std::fs::create_dir_all(&jobs_dir).unwrap();
+        std::fs::write(jobs_dir.join("sync.ts"), "export default {}").unwrap();
+
+        // Also create a non-matching file
+        let utils_dir = dir.path().join("src").join("utils");
+        std::fs::create_dir_all(&utils_dir).unwrap();
+        std::fs::write(utils_dir.join("format.ts"), "export default {}").unwrap();
+
+        let config = DiffcoreConfig::from_str(
+            r#"
+[entrypoints]
+http = ["src/routes/*.ts"]
+workers = ["src/jobs/*.ts"]
+"#,
+        )
+        .unwrap();
+
+        let resolved = config.resolve_entrypoint_globs(dir.path());
+        assert_eq!(resolved.len(), 3);
+
+        // All resolved paths should be under src/routes or src/jobs
+        let route_count = resolved
+            .iter()
+            .filter(|p| p.to_string_lossy().contains("routes"))
+            .count();
+        let job_count = resolved
+            .iter()
+            .filter(|p| p.to_string_lossy().contains("jobs"))
+            .count();
+        assert_eq!(route_count, 2);
+        assert_eq!(job_count, 1);
+
+        // utils/format.ts should NOT be included
+        assert!(!resolved
+            .iter()
+            .any(|p| p.to_string_lossy().contains("utils")));
+    }
+
+    #[test]
+    fn test_ignore_patterns() {
+        let config = DiffcoreConfig::from_str(
+            r#"
+[ignore]
+paths = ["**/*.test.ts", "**/*.spec.ts", "migrations/**"]
+"#,
+        )
+        .unwrap();
+
+        // These should be ignored
+        assert!(config.is_ignored("src/services/user.test.ts"));
+        assert!(config.is_ignored("src/handlers/auth.spec.ts"));
+        assert!(config.is_ignored("migrations/001_create_users.sql"));
+
+        // These should NOT be ignored
+        assert!(!config.is_ignored("src/services/user.ts"));
+        assert!(!config.is_ignored("src/handlers/auth.ts"));
+        assert!(!config.is_ignored("src/utils/format.ts"));
+    }
+
+    #[test]
+    fn test_custom_layer_names() {
+        let config = DiffcoreConfig::from_str(
+            r#"
+[layers]
+api = "src/handlers/**"
+domain = "src/services/**"
+persistence = "src/repositories/**"
+ui = "src/components/**"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.layer_for_path("src/handlers/users.ts"),
+            Some("api".to_string())
+        );
+        assert_eq!(
+            config.layer_for_path("src/services/auth.ts"),
+            Some("domain".to_string())
+        );
+        assert_eq!(
+            config.layer_for_path("src/repositories/user-repo.ts"),
+            Some("persistence".to_string())
+        );
+        assert_eq!(
+            config.layer_for_path("src/components/Button.tsx"),
+            Some("ui".to_string())
+        );
+        // File not matching any layer
+        assert_eq!(config.layer_for_path("src/utils/format.ts"), None);
+    }
+
+    // ── Additional unit tests ──
+
+    #[test]
+    fn test_default_ranking_weights() {
+        let config = DiffcoreConfig::default();
+        assert!((config.ranking.risk - 0.35).abs() < f64::EPSILON);
+        assert!((config.ranking.centrality - 0.25).abs() < f64::EPSILON);
+        assert!((config.ranking.surface_area - 0.20).abs() < f64::EPSILON);
+        assert!((config.ranking.uncertainty - 0.20).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_invalid_llm_provider() {
+        let toml_str = r#"
+[llm]
+provider = "invalid-provider"
+"#;
+        let result = DiffcoreConfig::from_str(toml_str);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ConfigError::Validation(msg) => {
+                assert!(msg.contains("Unknown LLM provider"));
+                assert!(msg.contains("invalid-provider"));
+            }
+            err => panic!("Expected validation error, got: {:?}", err),
+        }
+    }
+
+    #[test]
+    fn test_negative_ranking_weight_rejected() {
+        let toml_str = r#"
+[ranking]
+risk = -0.5
+centrality = 0.25
+surface_area = 0.20
+uncertainty = 0.20
+"#;
+        let result = DiffcoreConfig::from_str(toml_str);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ConfigError::Validation(msg) => {
+                assert!(msg.contains("non-negative"));
+            }
+            err => panic!("Expected validation error, got: {:?}", err),
+        }
+    }
+
+    #[test]
+    fn test_load_from_dir_with_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join(".diffcore.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[project]
+name = "test-project"
+
+[ranking]
+risk = 0.5
+centrality = 0.5
+surface_area = 0.0
+uncertainty = 0.0
+"#,
+        )
+        .unwrap();
+
+        let config = DiffcoreConfig::load_from_dir(dir.path()).unwrap();
+        assert_eq!(config.project.name, Some("test-project".to_string()));
+        assert!((config.ranking.risk - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_empty_config_file() {
+        // A completely empty file should produce defaults
+        let config = DiffcoreConfig::from_str("").unwrap();
+        assert_eq!(config, DiffcoreConfig::default());
+    }
+
+    #[test]
+    fn test_key_cmd_preserved() {
+        let toml_str = r#"
+[llm]
+provider = "anthropic"
+key_cmd = "op read op://vault/diffcore/api-key"
+"#;
+        let config = DiffcoreConfig::from_str(toml_str).unwrap();
+        assert_eq!(
+            config.llm.key_cmd,
+            Some("op read op://vault/diffcore/api-key".to_string())
+        );
+    }
+
+    #[test]
+    fn test_config_key_parsed() {
+        let toml_str = r#"
+[llm]
+provider = "anthropic"
+key = "sk-ant-test-key-12345"
+"#;
+        let config = DiffcoreConfig::from_str(toml_str).unwrap();
+        assert_eq!(config.llm.key, Some("sk-ant-test-key-12345".to_string()));
+    }
+
+    #[test]
+    fn test_config_key_not_serialized_when_none() {
+        let config = DiffcoreConfig::default();
+        let toml_str = toml::to_string_pretty(&config).unwrap();
+        // key should not appear in output when None (skip_serializing_if)
+        assert!(!toml_str.contains("key ="));
+    }
+
+    #[test]
+    fn test_config_key_roundtrip_via_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = DiffcoreConfig::default();
+        config.llm.provider = Some("anthropic".to_string());
+        config.llm.key = Some("sk-roundtrip-test".to_string());
+        config.save_to_dir(dir.path()).unwrap();
+
+        let loaded = DiffcoreConfig::load_from_dir(dir.path()).unwrap();
+        assert_eq!(loaded.llm.key, Some("sk-roundtrip-test".to_string()));
+    }
+
+    #[test]
+    fn test_multiple_entrypoint_types() {
+        let toml_str = r#"
+[entrypoints]
+http = ["src/routes/**/*.ts", "src/api/**/*.ts"]
+workers = ["src/jobs/**/*.ts"]
+cli = ["src/cli/main.rs"]
+cron = ["src/cron/**/*.ts"]
+events = ["src/handlers/events/**/*.ts"]
+"#;
+        let config = DiffcoreConfig::from_str(toml_str).unwrap();
+        assert_eq!(config.entrypoints.http.len(), 2);
+        assert_eq!(config.entrypoints.workers.len(), 1);
+        assert_eq!(config.entrypoints.cli.len(), 1);
+        assert_eq!(config.entrypoints.cron.len(), 1);
+        assert_eq!(config.entrypoints.events.len(), 1);
+    }
+
+    #[test]
+    fn test_serialization_roundtrip() {
+        let original = DiffcoreConfig {
+            project: ProjectConfig {
+                name: Some("roundtrip-test".to_string()),
+            },
+            entrypoints: EntrypointConfig {
+                http: vec!["src/routes/**/*.ts".to_string()],
+                ..Default::default()
+            },
+            layers: {
+                let mut m = HashMap::new();
+                m.insert("api".to_string(), "src/handlers/**".to_string());
+                m
+            },
+            ignore: IgnoreConfig {
+                paths: vec!["**/*.test.ts".to_string()],
+                auto_subtrees: true,
+            },
+            llm: LlmConfig {
+                provider: Some("anthropic".to_string()),
+                model: Some("claude-sonnet-4-6".to_string()),
+                key_cmd: None,
+                key: None,
+                ..Default::default()
+            },
+            ranking: RankWeights {
+                risk: 0.4,
+                centrality: 0.3,
+                surface_area: 0.15,
+                uncertainty: 0.15,
+            },
+            diff: DiffConfig::default(),
+        };
+
+        // Serialize to JSON, deserialize back
+        let json = serde_json::to_string(&original).unwrap();
+        let deserialized: DiffcoreConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(original, deserialized);
+    }
+
+    #[test]
+    fn test_ignore_empty_patterns() {
+        let config = DiffcoreConfig::default();
+        // With no ignore patterns, nothing should be ignored
+        assert!(!config.is_ignored("any/file.ts"));
+        assert!(!config.is_ignored("test/file.spec.ts"));
+    }
+
+    #[test]
+    fn test_layer_for_path_no_layers() {
+        let config = DiffcoreConfig::default();
+        assert_eq!(config.layer_for_path("src/anything.ts"), None);
+    }
+
+    // ── Refinement Config Tests ──
+
+    #[test]
+    fn test_refinement_config_defaults() {
+        let config = DiffcoreConfig::default();
+        assert!(config.llm.refinement.enabled);
+        assert_eq!(config.llm.refinement.provider, None);
+        assert_eq!(config.llm.refinement.model, None);
+        assert_eq!(config.llm.refinement.key_cmd, None);
+    }
+
+    #[test]
+    fn test_parse_refinement_config() {
+        let toml_str = r#"
+[llm]
+provider = "anthropic"
+
+[llm.refinement]
+enabled = true
+provider = "openai"
+model = "gpt-4.1"
+"#;
+        let config = DiffcoreConfig::from_str(toml_str).unwrap();
+        assert!(config.llm.refinement.enabled);
+        assert_eq!(config.llm.refinement.provider, Some("openai".to_string()));
+        assert_eq!(config.llm.refinement.model, Some("gpt-4.1".to_string()));
+    }
+
+    #[test]
+    fn test_refinement_enabled_by_default() {
+        let toml_str = r#"
+[llm]
+provider = "anthropic"
+"#;
+        let config = DiffcoreConfig::from_str(toml_str).unwrap();
+        assert!(config.llm.refinement.enabled);
+    }
+
+    #[test]
+    fn test_refinement_invalid_provider_rejected() {
+        let toml_str = r#"
+[llm.refinement]
+enabled = true
+provider = "invalid"
+"#;
+        let result = DiffcoreConfig::from_str(toml_str);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ConfigError::Validation(msg) => {
+                assert!(msg.contains("refinement provider"));
+                assert!(msg.contains("invalid"));
+            }
+            err => panic!("Expected validation error, got: {:?}", err),
+        }
+    }
+
+    // ── Metadata Config Tests ──
+
+    #[test]
+    fn test_metadata_config_defaults() {
+        let config = DiffcoreConfig::default();
+        assert!(config.llm.metadata.enabled);
+        assert_eq!(config.llm.metadata.provider, None);
+        assert_eq!(config.llm.metadata.model, None);
+        assert_eq!(config.llm.metadata.key_cmd, None);
+        assert_eq!(config.llm.metadata.key, None);
+        assert_eq!(config.llm.metadata.batch_size, 20);
+    }
+
+    #[test]
+    fn test_parse_metadata_config() {
+        let toml_str = r#"
+[llm]
+provider = "anthropic"
+
+[llm.metadata]
+enabled = true
+provider = "anthropic"
+model = "claude-haiku-4-5-20251001"
+key_cmd = "op read op://vault/item/field"
+batch_size = 5
+"#;
+        let config = DiffcoreConfig::from_str(toml_str).unwrap();
+        assert!(config.llm.metadata.enabled);
+        assert_eq!(config.llm.metadata.provider, Some("anthropic".to_string()));
+        assert_eq!(
+            config.llm.metadata.model,
+            Some("claude-haiku-4-5-20251001".to_string())
+        );
+        assert_eq!(
+            config.llm.metadata.key_cmd,
+            Some("op read op://vault/item/field".to_string())
+        );
+        assert_eq!(config.llm.metadata.batch_size, 5);
+    }
+
+    #[test]
+    fn test_metadata_enabled_by_default() {
+        let config = DiffcoreConfig::from_str("[llm]\nprovider = \"anthropic\"\n").unwrap();
+        assert!(config.llm.metadata.enabled);
+        assert_eq!(config.llm.metadata.batch_size, 20);
+    }
+
+    #[test]
+    fn test_metadata_invalid_provider_rejected() {
+        let toml_str = r#"
+[llm.metadata]
+provider = "invalid"
+"#;
+        match DiffcoreConfig::from_str(toml_str).unwrap_err() {
+            ConfigError::Validation(msg) => {
+                assert!(msg.contains("metadata provider"));
+                assert!(msg.contains("invalid"));
+            }
+            err => panic!("Expected validation error, got: {:?}", err),
+        }
+    }
+
+    #[test]
+    fn test_metadata_zero_batch_size_rejected() {
+        let toml_str = r#"
+[llm.metadata]
+batch_size = 0
+"#;
+        match DiffcoreConfig::from_str(toml_str).unwrap_err() {
+            ConfigError::Validation(msg) => {
+                assert!(msg.contains("batch_size"));
+            }
+            err => panic!("Expected validation error, got: {:?}", err),
+        }
+    }
+
+    #[test]
+    fn test_metadata_provider_independent_of_refinement() {
+        let toml_str = r#"
+[llm]
+provider = "anthropic"
+
+[llm.refinement]
+provider = "openai"
+
+[llm.metadata]
+provider = "gemini"
+"#;
+        let config = DiffcoreConfig::from_str(toml_str).unwrap();
+        assert_eq!(config.llm.provider, Some("anthropic".to_string()));
+        assert_eq!(config.llm.refinement.provider, Some("openai".to_string()));
+        assert_eq!(config.llm.metadata.provider, Some("gemini".to_string()));
+    }
+
+    #[test]
+    fn test_metadata_merges_from_global_config() {
+        let mut local = DiffcoreConfig::from_str("[llm.metadata]\nbatch_size = 20\n").unwrap();
+        let mut global = DiffcoreConfig::default();
+        global.llm.metadata.provider = Some("gemini".to_string());
+        global.llm.metadata.model = Some("gemini-2.5-flash".to_string());
+        global.llm.metadata.batch_size = 7;
+
+        local.apply_global_llm_defaults(&global);
+
+        assert_eq!(local.llm.metadata.provider, Some("gemini".to_string()));
+        assert_eq!(
+            local.llm.metadata.model,
+            Some("gemini-2.5-flash".to_string())
+        );
+        assert_eq!(local.llm.metadata.batch_size, 7);
+    }
+
+    #[test]
+    fn test_metadata_local_config_wins_over_global() {
+        let mut local =
+            DiffcoreConfig::from_str("[llm.metadata]\nprovider = \"openai\"\nbatch_size = 3\n")
+                .unwrap();
+        let mut global = DiffcoreConfig::default();
+        global.llm.metadata.provider = Some("gemini".to_string());
+        global.llm.metadata.batch_size = 7;
+
+        local.apply_global_llm_defaults(&global);
+
+        assert_eq!(local.llm.metadata.provider, Some("openai".to_string()));
+        assert_eq!(local.llm.metadata.batch_size, 3);
+    }
+
+    #[test]
+    fn test_refinement_different_provider_from_annotation() {
+        let toml_str = r#"
+[llm]
+provider = "anthropic"
+model = "claude-sonnet-4-6"
+
+[llm.refinement]
+enabled = true
+provider = "gemini"
+model = "gemini-2.5-pro"
+"#;
+        let config = DiffcoreConfig::from_str(toml_str).unwrap();
+        assert_eq!(config.llm.provider, Some("anthropic".to_string()));
+        assert_eq!(config.llm.refinement.provider, Some("gemini".to_string()));
+    }
+
+    #[test]
+    fn test_refinement_key_cmd() {
+        let toml_str = r#"
+[llm.refinement]
+enabled = true
+provider = "anthropic"
+key_cmd = "op read op://vault/diffcore/refinement-key"
+"#;
+        let config = DiffcoreConfig::from_str(toml_str).unwrap();
+        assert_eq!(
+            config.llm.refinement.key_cmd,
+            Some("op read op://vault/diffcore/refinement-key".to_string())
+        );
+    }
+
+    // ── Property-Based Tests ──
+
+    mod prop_tests {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            /// Parsing default config never panics
+            #[test]
+            fn prop_default_config_always_valid(_seed in 0u64..1000) {
+                let config = DiffcoreConfig::default();
+                config.validate().unwrap();
+            }
+
+            /// Any non-negative weights produce a valid config
+            #[test]
+            fn prop_non_negative_weights_valid(
+                risk in 0.0f64..=10.0,
+                centrality in 0.0f64..=10.0,
+                surface_area in 0.0f64..=10.0,
+                uncertainty in 0.0f64..=10.0,
+            ) {
+                let toml_str = format!(
+                    "[ranking]\nrisk = {}\ncentrality = {}\nsurface_area = {}\nuncertainty = {}",
+                    risk, centrality, surface_area, uncertainty
+                );
+                let result = DiffcoreConfig::from_str(&toml_str);
+                prop_assert!(result.is_ok(), "Valid weights should parse: {:?}", result.err());
+            }
+
+            /// is_ignored never panics on arbitrary paths
+            #[test]
+            fn prop_is_ignored_no_panic(path in "[a-zA-Z0-9/_.-]{0,100}") {
+                let config = DiffcoreConfig::from_str(
+                    r#"
+[ignore]
+paths = ["**/*.test.ts", "**/*.spec.ts"]
+"#
+                ).unwrap();
+                // Just assert it doesn't panic
+                let _ = config.is_ignored(&path);
+            }
+
+            /// layer_for_path never panics on arbitrary paths
+            #[test]
+            fn prop_layer_for_path_no_panic(path in "[a-zA-Z0-9/_.-]{0,100}") {
+                let config = DiffcoreConfig::from_str(
+                    r#"
+[layers]
+api = "src/handlers/**"
+domain = "src/services/**"
+"#
+                ).unwrap();
+                let _ = config.layer_for_path(&path);
+            }
+
+            /// Empty TOML string always produces default config
+            #[test]
+            fn prop_empty_string_is_default(_seed in 0u64..100) {
+                let config = DiffcoreConfig::from_str("").unwrap();
+                prop_assert_eq!(config, DiffcoreConfig::default());
+            }
+
+            /// Serialization roundtrip preserves config (within f64 precision)
+            #[test]
+            fn prop_json_roundtrip(
+                risk in 0.0f64..=10.0,
+                centrality in 0.0f64..=10.0,
+                surface_area in 0.0f64..=10.0,
+                uncertainty in 0.0f64..=10.0,
+            ) {
+                let config = DiffcoreConfig {
+                    ranking: RankWeights { risk, centrality, surface_area, uncertainty },
+                    ..Default::default()
+                };
+                let json = serde_json::to_string(&config).unwrap();
+                let roundtripped: DiffcoreConfig = serde_json::from_str(&json).unwrap();
+                // Use approximate comparison for f64 fields due to JSON serialization precision
+                prop_assert!((config.ranking.risk - roundtripped.ranking.risk).abs() < 1e-10);
+                prop_assert!((config.ranking.centrality - roundtripped.ranking.centrality).abs() < 1e-10);
+                prop_assert!((config.ranking.surface_area - roundtripped.ranking.surface_area).abs() < 1e-10);
+                prop_assert!((config.ranking.uncertainty - roundtripped.ranking.uncertainty).abs() < 1e-10);
+                prop_assert_eq!(config.project, roundtripped.project);
+                prop_assert_eq!(config.entrypoints, roundtripped.entrypoints);
+                prop_assert_eq!(config.layers, roundtripped.layers);
+                prop_assert_eq!(config.ignore, roundtripped.ignore);
+                prop_assert_eq!(config.llm, roundtripped.llm);
+            }
+        }
+    }
+
+    // ── Annotations Enabled Tests ──
+
+    #[test]
+    fn test_annotations_enabled_defaults_true() {
+        let config = DiffcoreConfig::default();
+        assert!(config.llm.annotations_enabled);
+    }
+
+    #[test]
+    fn test_annotations_enabled_serde_default_true() {
+        // When annotations_enabled is missing from TOML, it should default to true
+        let toml_str = r#"
+[llm]
+provider = "anthropic"
+"#;
+        let config = DiffcoreConfig::from_str(toml_str).unwrap();
+        assert!(config.llm.annotations_enabled);
+    }
+
+    #[test]
+    fn test_annotations_enabled_explicit_false() {
+        let toml_str = r#"
+[llm]
+provider = "anthropic"
+annotations_enabled = false
+"#;
+        let config = DiffcoreConfig::from_str(toml_str).unwrap();
+        assert!(!config.llm.annotations_enabled);
+    }
+
+    #[test]
+    fn test_annotations_enabled_explicit_true() {
+        let toml_str = r#"
+[llm]
+provider = "anthropic"
+annotations_enabled = true
+"#;
+        let config = DiffcoreConfig::from_str(toml_str).unwrap();
+        assert!(config.llm.annotations_enabled);
+    }
+
+    #[test]
+    fn test_annotations_enabled_roundtrip() {
+        let mut config = DiffcoreConfig::default();
+        config.llm.annotations_enabled = false;
+
+        let toml_str = toml::to_string_pretty(&config).unwrap();
+        let back = DiffcoreConfig::from_str(&toml_str).unwrap();
+        assert!(!back.llm.annotations_enabled);
+    }
+
+    #[test]
+    fn test_annotations_enabled_json_roundtrip() {
+        let config = LlmConfig {
+            annotations_enabled: false,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let back: LlmConfig = serde_json::from_str(&json).unwrap();
+        assert!(!back.annotations_enabled);
+    }
+
+    #[test]
+    fn test_refinement_enabled_defaults_true_in_llm_config() {
+        let config = LlmConfig::default();
+        assert!(config.refinement.enabled);
+    }
+
+    #[test]
+    fn test_refinement_enabled_explicit_false_overrides_default() {
+        let toml_str = r#"
+[llm.refinement]
+enabled = false
+"#;
+        let config = DiffcoreConfig::from_str(toml_str).unwrap();
+        assert!(!config.llm.refinement.enabled);
+    }
+
+    #[test]
+    fn test_both_defaults_true_on_empty_config() {
+        let config = DiffcoreConfig::default();
+        assert!(config.llm.annotations_enabled, "annotations should default to true");
+        assert!(config.llm.refinement.enabled, "refinement should default to true");
+    }
+
+    #[test]
+    fn test_both_defaults_true_on_minimal_toml() {
+        let toml_str = "";
+        let config = DiffcoreConfig::from_str(toml_str).unwrap();
+        assert!(config.llm.annotations_enabled, "annotations should default to true");
+        assert!(config.llm.refinement.enabled, "refinement should default to true");
+    }
+
+    #[test]
+    fn test_annotations_and_refinement_independent() {
+        // Can enable one and disable the other
+        let toml_str = r#"
+[llm]
+annotations_enabled = false
+
+[llm.refinement]
+enabled = true
+"#;
+        let config = DiffcoreConfig::from_str(toml_str).unwrap();
+        assert!(!config.llm.annotations_enabled);
+        assert!(config.llm.refinement.enabled);
+
+        let toml_str2 = r#"
+[llm]
+annotations_enabled = true
+
+[llm.refinement]
+enabled = false
+"#;
+        let config2 = DiffcoreConfig::from_str(toml_str2).unwrap();
+        assert!(config2.llm.annotations_enabled);
+        assert!(!config2.llm.refinement.enabled);
+    }
+
+    #[test]
+    fn test_global_defaults_merge_with_annotations() {
+        // Test that global config merge still works with annotations_enabled
+        let mut local = DiffcoreConfig::from_str(r#"
+[llm]
+annotations_enabled = false
+"#).unwrap();
+        let global = DiffcoreConfig::from_str(r#"
+[llm]
+provider = "anthropic"
+
+[llm.refinement]
+enabled = true
+provider = "openai"
+"#).unwrap();
+
+        local.apply_global_llm_defaults(&global);
+
+        // Local explicit false should be preserved
+        assert!(!local.llm.annotations_enabled);
+        // Global provider should fill in missing local
+        assert_eq!(local.llm.provider, Some("anthropic".to_string()));
+        // Refinement from either local (default true) or global should be true
+        assert!(local.llm.refinement.enabled);
+    }
+
+    /// The whole global-config surface in one test.
+    ///
+    /// `DIFFCORE_CONFIG_HOME` and `HOME` are process-global, so every case that
+    /// needs them lives here rather than in parallel tests that would race.
+    #[test]
+    fn test_global_config_roundtrip_legacy_fallback_and_ui() {
+        let xdg = tempfile::tempdir().unwrap();
+        let fake_home = tempfile::tempdir().unwrap();
+        let prev_home = std::env::var_os("HOME");
+        std::env::set_var("DIFFCORE_CONFIG_HOME", xdg.path());
+        std::env::set_var("HOME", fake_home.path());
+
+        // 1. Nothing anywhere: defaults.
+        assert_eq!(DiffcoreConfig::global_config_source(), None);
+        assert_eq!(UiConfig::load(), UiConfig::default());
+
+        // 2. Only the pre-XDG `~/.diffcore/config.toml` exists: it is read.
+        let legacy_dir = fake_home.path().join(".diffcore");
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+        std::fs::write(
+            legacy_dir.join("config.toml"),
+            "[llm]\nkey = \"sk-legacy\"\n",
+        )
+        .unwrap();
+        let loaded = DiffcoreConfig::load_global().unwrap();
+        assert_eq!(
+            loaded.llm.key.as_deref(),
+            Some("sk-legacy"),
+            "legacy config should be read when no XDG config exists"
+        );
+        assert!(DiffcoreConfig::using_legacy_global_config());
+        assert_eq!(
+            DiffcoreConfig::global_config_source(),
+            Some(legacy_dir.join("config.toml")),
+            "the migration window must report the file actually in use"
+        );
+
+        // 3. Saving writes to the XDG path and leaves the legacy file alone.
+        let mut config = loaded;
+        config.llm.annotations_enabled = false;
+        config.llm.refinement.enabled = false;
+        config.save_global().unwrap();
+
+        assert!(xdg.path().join("config.toml").exists());
+        assert!(
+            legacy_dir.join("config.toml").exists(),
+            "legacy config must never be moved or deleted"
+        );
+
+        // 4. Everything survives the round trip, and XDG now wins over legacy.
+        let loaded = DiffcoreConfig::load_global().unwrap();
+        assert!(!loaded.llm.annotations_enabled);
+        assert!(!loaded.llm.refinement.enabled);
+        assert_eq!(loaded.llm.key.as_deref(), Some("sk-legacy"));
+
+        // 5. UI prefs round-trip through their own file, untouched by the above.
+        let ui = UiConfig {
+            theme_mode: ThemeMode::Light,
+            right_panel_width: 612,
+            right_panel_collapsed: true,
+            ..Default::default()
+        };
+        ui.save().unwrap();
+        assert_eq!(UiConfig::load(), ui);
+        assert!(xdg.path().join("ui.toml").exists());
+
+        // 6. A corrupt prefs file degrades to defaults instead of erroring.
+        std::fs::write(xdg.path().join("ui.toml"), "not = [valid").unwrap();
+        assert_eq!(UiConfig::load(), UiConfig::default());
+
+        // 7. The config file holding the API key is owner-only.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(xdg.path().join("config.toml"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "config.toml must not be world-readable");
+        }
+
+        // 8. During the migration window the reported source is the real one.
+        assert_eq!(
+            DiffcoreConfig::global_config_source(),
+            Some(xdg.path().join("config.toml"))
+        );
+        assert!(!DiffcoreConfig::using_legacy_global_config());
+
+        std::env::remove_var("DIFFCORE_CONFIG_HOME");
+        match prev_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    #[test]
+    fn ui_config_partial_fields_fall_back_to_defaults() {
+        let ui: UiConfig = toml::from_str("theme_mode = \"system\"\n").unwrap();
+        assert_eq!(ui.theme_mode, ThemeMode::System);
+        assert_eq!(ui.right_panel_width, 320);
+        assert_eq!(ui.theme_dark, "catppuccin-mocha");
+    }
+
+    #[test]
+    fn ui_config_rejects_unknown_theme_mode() {
+        assert!(toml::from_str::<UiConfig>("theme_mode = \"neon\"\n").is_err());
+    }
+
+    #[test]
+    fn ui_config_clamps_absurd_panel_width() {
+        let mut wide: UiConfig = toml::from_str("right_panel_width = 4000000\n").unwrap();
+        wide.clamp();
+        assert_eq!(wide.right_panel_width, MAX_PANEL_WIDTH);
+        let mut narrow: UiConfig = toml::from_str("right_panel_width = 1\n").unwrap();
+        narrow.clamp();
+        assert_eq!(narrow.right_panel_width, MIN_PANEL_WIDTH);
+    }
+
+    /// A negative width must not be able to break the whole prefs file.
+    #[test]
+    fn ui_config_survives_invalid_toml() {
+        assert!(toml::from_str::<UiConfig>("right_panel_width = -5\n").is_err());
+    }
+
+    /// `.diffcore.toml` comes from a potentially untrusted cloned repo; it must
+    /// not be able to carry UI preferences at all.
+    #[test]
+    fn project_config_does_not_carry_ui_prefs() {
+        // Unknown sections are ignored by serde, which is what we want: a
+        // cloned repo's `[ui]` is inert rather than an error the user must fix.
+        let config = DiffcoreConfig::from_str("[ui]\ntheme_mode = \"light\"\n").unwrap();
+        let reserialized = toml::to_string_pretty(&config).unwrap();
+        assert!(
+            !reserialized.contains("[ui]"),
+            "UI prefs must not round-trip through project config"
+        );
+    }
+
+    // ── auto_subtrees Tests ──
+
+    #[test]
+    fn auto_subtrees_defaults_true() {
+        let config = DiffcoreConfig::default();
+        assert!(config.ignore.auto_subtrees);
+    }
+
+    #[test]
+    fn auto_subtrees_defaults_true_on_empty_toml() {
+        let config = DiffcoreConfig::from_str("").unwrap();
+        assert!(config.ignore.auto_subtrees);
+    }
+
+    #[test]
+    fn auto_subtrees_can_be_disabled() {
+        let toml_str = r#"
+[ignore]
+auto_subtrees = false
+"#;
+        let config = DiffcoreConfig::from_str(toml_str).unwrap();
+        assert!(!config.ignore.auto_subtrees);
+    }
+
+    #[test]
+    fn apply_detected_subtrees_is_noop_when_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        let mut config = DiffcoreConfig::default();
+        config.ignore.auto_subtrees = false;
+        config.ignore.paths.push("foo/**".to_string());
+
+        let detected = config.apply_detected_subtrees(&repo);
+        assert!(detected.is_empty());
+        assert_eq!(config.ignore.paths, vec!["foo/**".to_string()]);
+    }
+
+    #[test]
+    fn apply_detected_subtrees_appends_detected_globs() {
+        // Build a repo with a squashed-subtree commit whose path exists on disk.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        {
+            let mut cfg = repo.config().unwrap();
+            cfg.set_str("user.name", "Test").unwrap();
+            cfg.set_str("user.email", "test@test.com").unwrap();
+        }
+
+        // initial commit
+        let sig = repo.signature().unwrap();
+        std::fs::write(dir.path().join("README.md"), "root").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(std::path::Path::new("README.md")).unwrap();
+        index.write().unwrap();
+        let tree_oid = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_oid).unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "initial", &tree, &[])
+            .unwrap();
+
+        // subtree commit
+        std::fs::create_dir_all(dir.path().join("repos/effect")).unwrap();
+        std::fs::write(dir.path().join("repos/effect/package.json"), "{}").unwrap();
+        let mut index = repo.index().unwrap();
+        index
+            .add_path(std::path::Path::new("repos/effect/package.json"))
+            .unwrap();
+        index.write().unwrap();
+        let tree_oid = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_oid).unwrap();
+        let parent = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.commit(
+            Some("HEAD"),
+            &sig,
+            &sig,
+            "Squashed 'repos/effect/' content from commit deadbeef",
+            &tree,
+            &[&parent],
+        )
+        .unwrap();
+
+        let mut config = DiffcoreConfig::default();
+        let detected = config.apply_detected_subtrees(&repo);
+
+        assert_eq!(detected, vec!["repos/effect".to_string()]);
+        assert!(config.ignore.paths.contains(&"repos/effect/**".to_string()));
+        assert!(config.is_ignored("repos/effect/package.json"));
+        assert!(!config.is_ignored("apps/api/src/main.ts"));
+    }
+
+    #[test]
+    fn apply_detected_subtrees_does_not_duplicate_existing_patterns() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        let mut config = DiffcoreConfig::default();
+        // Pre-existing ignore entry for the same subtree.
+        config.ignore.paths.push("repos/effect/**".to_string());
+
+        // Call twice — should be idempotent.
+        let _ = config.apply_detected_subtrees(&repo);
+        let _ = config.apply_detected_subtrees(&repo);
+
+        let count = config
+            .ignore
+            .paths
+            .iter()
+            .filter(|p| *p == "repos/effect/**")
+            .count();
+        assert_eq!(count, 1);
+    }
+}
