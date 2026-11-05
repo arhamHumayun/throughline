@@ -1,10 +1,10 @@
 # visual-diff (working name)
 
-Cargo workspace. Today it holds one crate:
+Cargo workspace:
 
 - `crates/core` (`diffview-core`): pure data, no UI. git2 diff, tree-sitter IR (TypeScript/JavaScript + Python), symbol graph, entrypoint detection, flow groups, ranking. One call: `diffview_core::analysis::analyze(repo, &DiffSpec::Refs { base, head })`.
 
-The `app` crate (GPUI) comes next.
+- `crates/app` (`diffview-app`, bin `diffview`): GPUI hello world wired to core. Gpui pinned to zed rev 4a6121b. `cargo run --release -p diffview-app -- <repo> <base> <head>`. Linux needs libxkbcommon-dev, libxkbcommon-x11-dev, libwayland-dev.
 
 ## Provenance
 

@@ -1,0 +1,19 @@
+[package]
+name = "diffview-app"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[[bin]]
+name = "diffview"
+path = "src/main.rs"
+
+[dependencies]
+diffview-core = { path = "../core" }
+# Pinned. Grep zed/crates/gpui at this rev before writing any GPUI code.
+gpui = { git = "https://github.com/zed-industries/zed", rev = "4a6121bb0f10c6e8037b741b7dc0a4cd639ae289" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "4a6121bb0f10c6e8037b741b7dc0a4cd639ae289" }
+
+# On Linux the windowing backends are opt-in; without them no window appears.
+[target.'cfg(target_os = "linux")'.dependencies]
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "4a6121bb0f10c6e8037b741b7dc0a4cd639ae289", features = ["x11", "wayland"] }
