@@ -14,6 +14,7 @@ pub mod config;
 pub mod entrypoint;
 pub mod flow;
 pub mod flows;
+pub mod functions;
 pub mod git;
 pub mod graph;
 pub mod group_metadata;
