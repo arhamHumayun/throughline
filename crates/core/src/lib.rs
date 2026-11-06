@@ -17,6 +17,7 @@ pub mod flows;
 pub mod functions;
 pub mod git;
 pub mod graph;
+pub mod local;
 pub mod group_metadata;
 pub mod ir;
 pub mod naming;

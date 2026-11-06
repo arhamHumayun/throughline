@@ -1,27 +1,65 @@
-//! throughline: overview (a diff's flows) -> flow tree (who calls whom, and what
-//! changed in each file) -> one function, or the flow's whole diff.
-//! Repo and refs come from env: THROUGHLINE_REPO (default "."), THROUGHLINE_BASE ("main"), THROUGHLINE_HEAD ("HEAD").
+//! throughline: open a local repo -> choose what to compare -> overview (the diff's flows)
+//! -> flow tree (who calls whom, and what changed in each file) -> one function, or the
+//! flow's whole diff.
+//!
+//! The first screen opens a repo: a recent one, a folder from the system picker, a pasted
+//! path, or a folder dropped on the window. The second picks a base branch and what to compare
+//! it with: another local branch, or the working tree (commits plus uncommitted edits). The diff
+//! is what that side added since it forked from the base (`git diff base...head`).
+//!
 //! `throughline` opens the window; `throughline --snap out.png` renders it headless.
-//! For headless snaps, THROUGHLINE_OPEN=<n> starts on flow n's tree (0-based), and
-//! THROUGHLINE_OPEN=<n>:<f> on its diff at file f.
+//! Dev shortcut, mostly for headless snaps: THROUGHLINE_REPO=<path> skips the first screen, and
+//! with THROUGHLINE_BASE and THROUGHLINE_HEAD (a branch, or `worktree`) also the second.
+//! Then THROUGHLINE_OPEN=<n> starts on flow n's tree (0-based), and THROUGHLINE_OPEN=<n>:<f> on
+//! its diff at file f. THROUGHLINE_CONFIG_DIR overrides where the recent-repos list lives.
 //!
 //! Click a flow, then a file (its diff in the flow's diff) or one of its changed functions
 //! (just that function, with links to the changed functions it calls and that call it).
 //! Escape goes back one screen. In a diff, j/k move between changes and ]/[ between files.
 
-use rune::tok::type_;
-use rune::{AppSpec, Cx, El, Key, KeyEvent, ScrollSpec, Tx, col, row, text};
-use rune_kit::Kit;
-use rune_kit::diff::{DiffMode, DiffState, DiffView, FileDiff};
-use throughline_core::analysis::{DiffSpec, analyze};
-use throughline_core::flows::{Flow, is_test_or_story};
-use throughline_core::types::SymbolKind;
-use throughline_core::functions::{FnChange, Status, changed_functions};
+use std::path::{Path, PathBuf};
 
+use rune::tok::type_;
+use rune::{AppSpec, Cx, El, FileDialogOptions, Key, KeyEvent, Latest, ScrollSpec, TextEdit, Tx, Waker, col, row, text};
+use rune_kit::diff::{DiffMode, DiffState, DiffView, FileDiff};
+use rune_kit::{Button, ButtonVariant, Kit, TextInput};
+use throughline_core::analysis::{Analysis, DiffSpec, analyze};
+use throughline_core::flows::{Flow, is_test_or_story};
+use throughline_core::functions::{FnChange, Status, changed_functions};
+use throughline_core::local::{self, LocalRepo, Recent};
+use throughline_core::types::SymbolKind;
+
+/// What to compare the base with.
+#[derive(Clone, Debug, PartialEq)]
+enum Head {
+    /// The checkout as it is on disk: its commits plus uncommitted and untracked files.
+    Worktree,
+    Branch(String),
+}
+
+impl Head {
+    fn label(&self) -> &str {
+        match self {
+            Head::Worktree => "working tree",
+            Head::Branch(b) => b,
+        }
+    }
+}
+
+/// The comparison the overview and everything after it show.
 struct Repo {
-    path: std::path::PathBuf,
-    base: String,
-    head: String,
+    root: PathBuf,
+    /// The commit the old side is read from (the merge base).
+    base_sha: String,
+    /// The commit the new side is read from; `None` reads the working tree.
+    head_sha: Option<String>,
+}
+
+/// The repo chosen on the first screen, and the choice being made on the second.
+struct Pick {
+    repo: LocalRepo,
+    base: Option<String>,
+    head: Head,
 }
 
 enum Screen {
@@ -42,7 +80,16 @@ struct Open {
 }
 
 struct State {
-    repo: Repo,
+    recent: Recent,
+    recent_file: Option<PathBuf>,
+    /// The first screen's path field.
+    path: TextEdit,
+    /// `None` shows the first screen (open a repo).
+    pick: Option<Pick>,
+    /// The comparison running off the main thread: the root it ran in and its answer.
+    analysis: Latest<(PathBuf, Head, Result<Analysis, String>)>,
+    /// `None` shows the second screen (choose what to compare), once a repo is picked.
+    repo: Option<Repo>,
     title: String,
     flows: Vec<Flow>,
     standalone: Vec<String>,
@@ -66,42 +113,49 @@ fn dir(p: &str) -> &str {
     p.rsplit_once('/').map_or("", |(d, _)| d)
 }
 
+/// Where the recent-repos list lives: %APPDATA%\throughline on Windows, else
+/// $XDG_CONFIG_HOME/throughline or ~/.config/throughline.
+fn recent_file() -> Option<PathBuf> {
+    let env = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty()).map(PathBuf::from);
+    let dir = env("THROUGHLINE_CONFIG_DIR").or_else(|| {
+        let base = if cfg!(windows) {
+            env("APPDATA")
+        } else {
+            env("XDG_CONFIG_HOME").or_else(|| env("HOME").map(|h| h.join(".config")))
+        };
+        base.map(|b| b.join("throughline"))
+    })?;
+    Some(dir.join("recent.txt"))
+}
+
 fn init() -> State {
-    let var = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
-    let repo = Repo {
-        path: var("THROUGHLINE_REPO", ".").into(),
-        base: var("THROUGHLINE_BASE", "main"),
-        head: var("THROUGHLINE_HEAD", "HEAD"),
+    let recent_file = recent_file();
+    let mut s = State {
+        recent: recent_file.as_deref().map(Recent::load).unwrap_or_default(),
+        recent_file,
+        path: TextEdit::new(""),
+        pick: None,
+        analysis: Latest::default(),
+        repo: None,
+        title: String::new(),
+        flows: vec![],
+        standalone: vec![],
+        error: None,
+        open: None,
+        diff: DiffState::new(vec![]),
+        func_diff: DiffState::new(vec![]),
     };
-    let spec = DiffSpec::Refs { base: repo.base.clone(), head: repo.head.clone() };
-    let mut s = match analyze(&repo.path, &spec) {
-        Ok(a) => State {
-            title: format!(
-                "{} files, {} flows ({}...{})",
-                a.output.summary.total_files_changed,
-                a.flows.flows.len(),
-                repo.base,
-                repo.head
-            ),
-            flows: a.flows.flows,
-            standalone: a.flows.standalone,
-            error: None,
-            open: None,
-            diff: DiffState::new(vec![]),
-            func_diff: DiffState::new(vec![]),
-            repo,
-        },
-        Err(e) => State {
-            title: "throughline".into(),
-            flows: vec![],
-            standalone: vec![],
-            error: Some(format!("core: {e}")),
-            open: None,
-            diff: DiffState::new(vec![]),
-            func_diff: DiffState::new(vec![]),
-            repo,
-        },
-    };
+    let var = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+    if let Some(path) = var("THROUGHLINE_REPO") {
+        open_repo(&mut s, Path::new(&path));
+        if let (Some(p), Some(base), Some(head)) = (s.pick.as_mut(), var("THROUGHLINE_BASE"), var("THROUGHLINE_HEAD")) {
+            p.base = Some(base);
+            p.head = if head == "worktree" { Head::Worktree } else { Head::Branch(head) };
+            let (root, head) = (p.repo.root.clone(), p.head.clone());
+            let a = run_analysis(&root, p.base.as_deref().unwrap_or_default(), &head);
+            take_analysis(&mut s, root, head, a);
+        }
+    }
     if let Ok(v) = std::env::var("THROUGHLINE_OPEN") {
         let mut it = v.split(':').map(|x| x.parse::<usize>().ok());
         if let Some(Some(i)) = it.next() {
@@ -119,6 +173,103 @@ fn init() -> State {
     s
 }
 
+/// The usual first choice: the default branch against your branch, or against the working
+/// tree when it has uncommitted edits (your agent's output before you commit it).
+fn default_pick(repo: LocalRepo) -> Pick {
+    let base = repo.default_branch.clone();
+    let other = repo.branches.iter().find(|b| Some(*b) != base.as_ref()).cloned();
+    let head = match (&repo.current, repo.dirty) {
+        (_, true) => Head::Worktree,
+        (Some(c), false) if Some(c) != base.as_ref() => Head::Branch(c.clone()),
+        _ => other.map_or(Head::Worktree, Head::Branch),
+    };
+    Pick { repo, base, head }
+}
+
+/// First screen -> second: open the repository containing `path`.
+fn open_repo(s: &mut State, path: &Path) {
+    match local::open(path) {
+        Ok(r) => {
+            s.recent.push(&r.root);
+            if let Some(f) = &s.recent_file {
+                // Losing the recents list isn't worth failing the open over.
+                let _ = s.recent.save(f);
+            }
+            s.error = None;
+            s.pick = Some(default_pick(r));
+        }
+        Err(e) => s.error = Some(e.to_string()),
+    }
+}
+
+fn run_analysis(root: &Path, base: &str, head: &Head) -> Result<Analysis, String> {
+    let spec = match head {
+        Head::Worktree => DiffSpec::BranchToWorkdir { base: base.to_string() },
+        Head::Branch(h) => DiffSpec::Refs { base: base.to_string(), head: h.clone() },
+    };
+    analyze(root, &spec).map_err(|e| e.to_string())
+}
+
+/// Second screen -> overview: start the comparison. Headless runs analyze in place, so a
+/// snapshot shows the result instead of the wait.
+fn compare(s: &mut State) {
+    let Some(p) = &s.pick else { return };
+    let Some(base) = p.base.clone() else {
+        s.error = Some("Pick a base branch".into());
+        return;
+    };
+    if p.head == Head::Branch(base.clone()) {
+        s.error = Some(format!("{base} compared with itself is empty; pick another branch or the working tree"));
+        return;
+    }
+    let (root, head) = (p.repo.root.clone(), p.head.clone());
+    s.error = None;
+    if rune::tooling::headless_run().is_some() {
+        let a = run_analysis(&root, &base, &head);
+        take_analysis(s, root, head, a);
+    } else {
+        s.analysis.request((root, head, base), |(root, head, base)| {
+            let a = run_analysis(&root, &base, &head);
+            (root, head, a)
+        });
+    }
+}
+
+fn take_analysis(s: &mut State, root: PathBuf, head: Head, a: Result<Analysis, String>) {
+    // Ignore an answer for a repo or choice the user has since left.
+    let Some(p) = &s.pick else { return };
+    if p.repo.root != root || p.head != head {
+        return;
+    }
+    let base = p.base.clone().unwrap_or_default();
+    match a {
+        Ok(a) => {
+            s.title = format!(
+                "{} files, {} flows ({base}...{})",
+                a.output.summary.total_files_changed,
+                a.flows.flows.len(),
+                head.label()
+            );
+            s.flows = a.flows.flows;
+            s.standalone = a.flows.standalone;
+            s.error = None;
+            s.open = None;
+            s.repo = Some(Repo { root, base_sha: a.base_sha.unwrap_or(base), head_sha: a.head_sha });
+        }
+        Err(e) => s.error = Some(e),
+    }
+}
+
+fn poll(s: &mut State, _: f64, _: &mut Tx) -> bool {
+    let Some((root, head, a)) = s.analysis.take() else { return false };
+    take_analysis(s, root, head, a);
+    true
+}
+
+fn setup(s: &mut State, waker: Waker) {
+    s.analysis.set_waker(waker);
+}
+
 /// Files in reading order: the call tree depth first, then the flow's tests.
 fn flow_paths(f: &Flow) -> Vec<&str> {
     let mut out: Vec<&str> = f.tree.iter().filter(|n| !n.repeat).map(|n| n.file.as_str()).collect();
@@ -128,21 +279,24 @@ fn flow_paths(f: &Flow) -> Vec<&str> {
 
 /// Base and head text of each file. Added files have an empty base, deleted an empty head.
 fn load_texts(repo: &Repo, paths: &[&str]) -> Result<Vec<(String, String)>, String> {
-    let r = git2::Repository::open(&repo.path).map_err(|e| e.to_string())?;
+    let r = git2::Repository::open(&repo.root).map_err(|e| e.to_string())?;
     let at = |rev: &str, p: &str| throughline_core::git::file_content_at_ref(&r, rev, p).map_err(|e| e.to_string());
     let mut out = Vec::with_capacity(paths.len());
     for p in paths {
-        let old = at(&repo.base, p)?.unwrap_or_default();
-        let new = at(&repo.head, p)?.unwrap_or_default();
-        out.push((old, new));
+        let old = at(&repo.base_sha, p)?.unwrap_or_default();
+        let new = match &repo.head_sha {
+            Some(h) => at(h, p)?,
+            None => local::workdir_text(&repo.root, p),
+        };
+        out.push((old, new.unwrap_or_default()));
     }
     Ok(out)
 }
 
 fn open_flow(s: &mut State, i: usize) {
-    let Some(f) = s.flows.get(i) else { return };
+    let (Some(f), Some(repo)) = (s.flows.get(i), &s.repo) else { return };
     let paths = flow_paths(f);
-    match load_texts(&s.repo, &paths) {
+    match load_texts(repo, &paths) {
         Ok(texts) => {
             let files = paths.iter().zip(&texts).map(|(p, (o, n))| FileDiff::from_texts(*p, o, n)).collect();
             let fns = paths
@@ -214,11 +368,148 @@ fn overview(s: &State) -> El {
         let names: Vec<&str> = s.standalone.iter().map(|p| stem(p)).collect();
         list = list.child(text(format!("Standalone: {}", names.join(", "))).color(k.c.text_muted));
     }
-    let mut c = page(&k).child(text(s.title.as_str()).font(type_::TITLE).color(k.c.text_base));
+    if s.flows.is_empty() && s.standalone.is_empty() {
+        list = list.child(text("No code changes to show.").color(k.c.text_muted).padding(8.0));
+    }
+    let name = s.pick.as_ref().map_or("Compare", |p| p.repo.name.as_str());
+    let mut c = page(&k).child(bar(&k, name, &s.title));
     if let Some(e) = &s.error {
         c = c.child(text(e.as_str()).color(k.c.danger.fg));
     }
-    c.child(list)
+    c.child(col().key("flows").w_full().grow(1.0).min_h(0.0).scroll(ScrollSpec { stick_bottom: false }).child(list))
+}
+
+/// Screen 0: open a repository. Recent repos, the system folder picker, a pasted path, or a
+/// folder dropped on the window.
+fn open_screen(s: &State) -> El {
+    let k = Kit::neutral(true);
+    let field = TextInput::new(&s.path)
+        .placeholder("Paste a repository path and press Enter")
+        .on_edit(|s: &mut State| &mut s.path)
+        .on_submit(|s: &mut State, _: &mut Tx| {
+            let p = s.path.text.trim().to_string();
+            if !p.is_empty() {
+                open_repo(s, Path::new(&p));
+            }
+        })
+        .build(&k);
+    let browse = Button::new("Choose folder\u{2026}")
+        .variant(ButtonVariant::Contrast)
+        .on_press_tx(|_: &mut State, tx: &mut Tx| {
+            let opts = FileDialogOptions { title: "Open a git repository".into(), ..Default::default() };
+            tx.open_folder(opts, |s: &mut State, r, _| match r {
+                Ok(Some(p)) => open_repo(s, &p),
+                Ok(None) => {}
+                Err(e) => s.error = Some(format!("folder picker: {e}")),
+            });
+        })
+        .build(&k)
+        .key("browse");
+    let mut c = page(&k)
+        .child(text("Open a repository").font(type_::TITLE).color(k.c.text_base))
+        .child(row().w_full().gap(8.0).items_center().child(browse).child(col().grow(1.0).child(field)));
+    if let Some(e) = &s.error {
+        c = c.child(text(e.as_str()).color(k.c.danger.fg));
+    }
+    let mut list = col().gap(2.0);
+    for (i, p) in s.recent.existing().enumerate() {
+        let name = p.file_name().map_or_else(|| p.display().to_string(), |n| n.to_string_lossy().into_owned());
+        let path = p.clone();
+        list = list.child(
+            row()
+                .key(format!("recent-{i}"))
+                .padding(8.0)
+                .gap(12.0)
+                .radius(6.0)
+                .items_center()
+                .child(text(name).color(k.c.text_base))
+                .child(text(p.display().to_string()).color(k.c.text_faint))
+                .on_press(move |s: &mut State| open_repo(s, &path)),
+        );
+    }
+    if s.recent.existing().next().is_some() {
+        c = c.child(text("Recent").color(k.c.text_muted).px(8.0)).child(list);
+    } else {
+        c = c.child(text("Or drop a repository folder here.").color(k.c.text_faint).px(8.0));
+    }
+    c.on_drop_files(|s: &mut State, files: &[PathBuf], _: &mut Tx| {
+        if let Some(p) = files.first() {
+            open_repo(s, p);
+        }
+    })
+    .accepts_files(|p| p.is_dir())
+}
+
+fn choice(k: &Kit, key: String, label: &str, note: &str, on: bool) -> El {
+    let mut r = row().key(key).px(8.0).py(5.0).gap(10.0).radius(6.0).items_center();
+    if on {
+        r = r.fill(k.c.layer_03);
+    }
+    r = r.child(text(label.to_string()).color(if on { k.c.text_base } else { k.c.text_muted }));
+    if !note.is_empty() {
+        r = r.child(text(note.to_string()).color(k.c.text_faint));
+    }
+    r
+}
+
+/// Screen 1: choose what to compare. A base branch on the left, and on the right what it's
+/// compared with: the working tree or another branch.
+fn compare_screen(s: &State, p: &Pick) -> El {
+    let k = Kit::neutral(true);
+    let current = p.repo.current.as_deref();
+    let note = |b: &str| if Some(b) == current { "checked out" } else { "" };
+    let mut bases = col().gap(2.0);
+    for (i, b) in p.repo.branches.iter().enumerate() {
+        let name = b.clone();
+        bases = bases.child(
+            choice(&k, format!("base-{i}"), b, note(b), p.base.as_deref() == Some(b))
+                .on_press(move |s: &mut State| if let Some(p) = s.pick.as_mut() { p.base = Some(name.clone()) }),
+        );
+    }
+    let wt_note = if p.repo.dirty { "your branch plus uncommitted changes" } else { "no uncommitted changes" };
+    let mut heads = col().gap(2.0).child(
+        choice(&k, "head-worktree".into(), "Working tree", wt_note, p.head == Head::Worktree)
+            .on_press(|s: &mut State| if let Some(p) = s.pick.as_mut() { p.head = Head::Worktree }),
+    );
+    for (i, b) in p.repo.branches.iter().enumerate() {
+        let h = Head::Branch(b.clone());
+        let on = p.head == h;
+        heads = heads.child(
+            choice(&k, format!("head-{i}"), b, note(b), on).on_press(move |s: &mut State| if let Some(p) = s.pick.as_mut() { p.head = h.clone() }),
+        );
+    }
+    let column = |label: &str, key: &str, list: El| {
+        col()
+            .grow(1.0)
+            .w(0.0)
+            .min_h(0.0)
+            .gap(6.0)
+            .child(text(label.to_string()).color(k.c.text_muted).px(8.0))
+            .child(col().key(key.to_string()).w_full().grow(1.0).min_h(0.0).scroll(ScrollSpec { stick_bottom: false }).child(list))
+    };
+    let base = p.base.as_deref().unwrap_or("?");
+    let busy = s.analysis.is_pending();
+    let go = Button::new(if busy { "Comparing\u{2026}".to_string() } else { format!("Compare {base} with {}", p.head.label()) })
+        .variant(if busy { ButtonVariant::Loading } else { ButtonVariant::Contrast })
+        .disabled(busy)
+        .on_press(compare)
+        .build(&k)
+        .key("compare");
+    let mut c = page(&k).child(bar(&k, "Repositories", &p.repo.name)).child(
+        row().w_full().gap(12.0).items_center().child(go).child(text(p.repo.root.display().to_string()).color(k.c.text_faint)),
+    );
+    if let Some(e) = &s.error {
+        c = c.child(text(e.as_str()).color(k.c.danger.fg));
+    }
+    c.child(
+        row()
+            .w_full()
+            .grow(1.0)
+            .min_h(0.0)
+            .gap(16.0)
+            .child(column("Base", "bases", bases))
+            .child(column("Compare with", "heads", heads)),
+    )
 }
 
 fn back(k: &Kit, label: &str) -> El {
@@ -231,9 +522,15 @@ fn back(k: &Kit, label: &str) -> El {
 }
 
 fn go_back(s: &mut State) {
+    s.error = None;
     match &mut s.open {
         Some(o) if !matches!(o.screen, Screen::Tree) => o.screen = Screen::Tree,
-        _ => s.open = None,
+        Some(_) => s.open = None,
+        None if s.repo.is_some() => s.repo = None,
+        None => {
+            s.analysis.cancel();
+            s.pick = None;
+        }
     }
 }
 
@@ -394,6 +691,10 @@ fn tree(s: &State, o: &Open) -> El {
 }
 
 fn view(s: &State, _: &mut Cx<State>) -> El {
+    let Some(p) = &s.pick else { return open_screen(s) };
+    if s.repo.is_none() {
+        return compare_screen(s, p);
+    }
     let Some(o) = &s.open else { return overview(s) };
     match &o.screen {
         Screen::Tree => return tree(s, o),
@@ -416,8 +717,12 @@ fn view(s: &State, _: &mut Cx<State>) -> El {
 }
 
 fn on_key(s: &mut State, ev: &KeyEvent, tx: &mut Tx) -> bool {
-    if s.open.is_some() && ev.key == Key::Escape {
+    if s.pick.is_some() && ev.key == Key::Escape {
         go_back(s);
+        return true;
+    }
+    if s.pick.is_some() && s.repo.is_none() && ev.key == Key::Enter && !s.analysis.is_pending() {
+        compare(s);
         return true;
     }
     match &mut s.open {
@@ -430,6 +735,8 @@ fn on_key(s: &mut State, ev: &KeyEvent, tx: &mut Tx) -> bool {
 fn main() {
     rune::App::new(AppSpec {
         on_key: Some(on_key),
+        setup: Some(setup),
+        poll: Some(poll),
         families: ("Inter", "ui-monospace, Inter"),
         ..AppSpec::new("throughline", (1200.0, 800.0), init, view)
     })

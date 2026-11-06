@@ -23,9 +23,10 @@ use crate::types::AnalysisOutput;
 /// Which changes to analyze.
 #[derive(Debug, Clone)]
 pub enum DiffSpec {
-    /// Committed changes between two refs (merge-base aware), working tree excluded.
+    /// What `head` added since it forked from `base` (`git diff base...head`), working tree excluded.
     Refs { base: String, head: String },
-    /// Branch `base` against the current working tree (your agent's uncommitted output).
+    /// What the working tree adds since the checkout forked from `base`: commits and
+    /// uncommitted edits, untracked files included (your agent's output before you push).
     BranchToWorkdir { base: String },
     Staged,
     Unstaged,
@@ -50,6 +51,10 @@ pub struct Analysis {
     pub output: AnalysisOutput,
     /// Stack-ordered flows: roots are changed code no other changed code calls.
     pub flows: Flows,
+    /// The commit the diff's old side is read from (for `Refs`, the merge base).
+    pub base_sha: Option<String>,
+    /// The commit the new side is read from; `None` when it is the working tree (or the index).
+    pub head_sha: Option<String>,
 }
 
 /// Analyze a diff in the repository containing `repo_path`.
@@ -66,17 +71,12 @@ pub fn analyze(repo_path: &Path, spec: &DiffSpec) -> Result<Analysis, AnalysisEr
 
     let (diff_result, diff_source) = match spec {
         DiffSpec::Refs { base, head } => {
-            let sel = git::diff_refs_with_worktree_fallback(&repo, base, head)?;
-            let src = output::diff_source_branch(
-                base,
-                head,
-                sel.diff.base_sha.as_deref(),
-                sel.diff.head_sha.as_deref(),
-            );
-            (sel.diff, src)
+            let d = git::diff_merge_base(&repo, base, head)?;
+            let src = output::diff_source_branch(base, head, d.base_sha.as_deref(), d.head_sha.as_deref());
+            (d, src)
         }
         DiffSpec::BranchToWorkdir { base } => {
-            let d = git::diff_branch_to_workdir(&repo, base)?;
+            let d = git::diff_merge_base_to_workdir(&repo, base, "HEAD")?;
             let src = output::diff_source_branch_with_worktree(base, d.base_sha.as_deref());
             (d, src)
         }
@@ -145,12 +145,77 @@ pub fn analyze(repo_path: &Path, spec: &DiffSpec) -> Result<Analysis, AnalysisEr
         })
     };
     let mut flows = flows::compute_ordered(&sym_graph, &changed_files, &first_use);
-    if let DiffSpec::Refs { base, head } = spec {
+    let range = match spec {
+        DiffSpec::Refs { base, head } => Some((base.as_str(), head.as_str())),
+        DiffSpec::BranchToWorkdir { base } => Some((base.as_str(), "HEAD")),
+        _ => None,
+    };
+    if let Some((base, head)) = range {
         // Naming is best effort: a failure here shouldn't fail the analysis.
         if let Ok(commits) = naming::commits_between(&repo, base, head) {
             naming::name_flows(&mut flows.flows, &commits);
         }
     }
     let output = build_analysis_output(&diff_result, diff_source, &parsed_files, &cluster_result, &ranked);
-    Ok(Analysis { output, flows })
+    let (base_sha, head_sha) = (diff_result.base_sha.clone(), diff_result.head_sha.clone());
+    Ok(Analysis { output, flows, base_sha, head_sha })
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use git2::{Signature, Time};
+
+    fn commit(repo: &Repository, msg: &str) -> git2::Oid {
+        let mut idx = repo.index().unwrap();
+        idx.add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None).unwrap();
+        idx.write().unwrap();
+        let tree = repo.find_tree(idx.write_tree().unwrap()).unwrap();
+        let sig = Signature::new("t", "t@e", &Time::new(0, 0)).unwrap();
+        let parent = repo.head().ok().and_then(|h| h.peel_to_commit().ok());
+        let parents: Vec<&git2::Commit> = parent.iter().collect();
+        repo.commit(Some("HEAD"), &sig, &sig, msg, &tree, &parents).unwrap()
+    }
+
+    fn changed(a: &Analysis) -> Vec<String> {
+        let mut v: Vec<String> = a.output.groups.iter().flat_map(|g| g.files.iter().map(|f| f.path.clone())).collect();
+        v.extend(a.output.infrastructure_group.iter().flat_map(|g| g.files.iter().cloned()));
+        v.sort();
+        v
+    }
+
+    /// Comparing a branch shows what it added since it forked, not what its base did since,
+    /// and the working tree option adds uncommitted and untracked files on top.
+    #[test]
+    fn compares_from_the_merge_base() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let w = |p: &str, s: &str| std::fs::write(dir.path().join(p), s).unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        w("a.ts", "export function a() { return 1; }\n");
+        let root = commit(&repo, "init");
+        let root = repo.find_commit(root).unwrap();
+        repo.branch("base", &root, true).unwrap();
+        repo.branch("feature", &root, true).unwrap();
+        // The base moves on after the fork.
+        repo.set_head("refs/heads/base").unwrap();
+        w("later.ts", "export function later() { return 2; }\n");
+        commit(&repo, "base moves on");
+        // The feature branch adds its own file.
+        repo.set_head("refs/heads/feature").unwrap();
+        repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force().remove_untracked(true))).unwrap();
+        w("feat.ts", "import { a } from './a';\nexport function feat() { return a(); }\n");
+        let feat = commit(&repo, "add feat");
+
+        let a = analyze(dir.path(), &DiffSpec::Refs { base: "base".into(), head: "feature".into() }).unwrap();
+        assert_eq!(changed(&a), vec!["feat.ts"]);
+        assert_eq!(a.base_sha, Some(root.id().to_string()));
+        assert_eq!(a.head_sha, Some(feat.to_string()));
+
+        w("wip.ts", "export function wip() { return 3; }\n");
+        let a = analyze(dir.path(), &DiffSpec::BranchToWorkdir { base: "base".into() }).unwrap();
+        assert_eq!(changed(&a), vec!["feat.ts", "wip.ts"]);
+        assert_eq!(a.base_sha, Some(root.id().to_string()));
+        assert_eq!(a.head_sha, None);
+    }
 }
