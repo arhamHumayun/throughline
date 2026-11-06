@@ -21,7 +21,7 @@ fn init() -> State {
             let mut lines: Vec<String> = f
                 .flows
                 .iter()
-                .map(|fl| format!("{}  ({} files, {} tests)", stem(&fl.root), fl.files.len(), fl.tests.len()))
+                .map(|fl| format!("{}  ({}, {} files)", fl.title, stem(&fl.root), fl.files.len()))
                 .collect();
             if !f.standalone.is_empty() {
                 lines.push(format!("Standalone: {}", f.standalone.iter().map(|p| stem(p)).collect::<Vec<_>>().join(", ")));

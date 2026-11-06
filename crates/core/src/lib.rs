@@ -18,6 +18,7 @@ pub mod git;
 pub mod graph;
 pub mod group_metadata;
 pub mod ir;
+pub mod naming;
 pub mod output;
 pub mod paths;
 pub mod pipeline;
