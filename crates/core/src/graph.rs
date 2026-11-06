@@ -10,6 +10,7 @@ use petgraph::graph::{DiGraph, NodeIndex};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
+use crate::tsconfig::PathAliases;
 use crate::ast::{Definition, ExportInfo, Language, ParsedFile};
 use crate::ir::{IrExport, IrFile, IrImportSpecifier, TypeDefKind};
 use crate::types::{EdgeType, SymbolKind};
@@ -74,6 +75,11 @@ impl SymbolGraph {
     /// entry file paths (e.g. `packages/pkg/src/index.ts`), enabling cross-package
     /// import edges in monorepo workspaces.
     pub fn build_with_workspace(files: &[ParsedFile], workspace_map: &WorkspaceMap) -> Self {
+        Self::build_with_resolver(files, &Resolver::new(workspace_map, &PathAliases::default()))
+    }
+
+    /// Build with workspace packages and tsconfig path aliases.
+    pub fn build_with_resolver(files: &[ParsedFile], workspace_map: &Resolver<'_>) -> Self {
         let mut graph = DiGraph::new();
         let mut id_to_index: HashMap<String, NodeIndex> = HashMap::new();
 
@@ -176,6 +182,11 @@ impl SymbolGraph {
 
     /// Build a symbol graph from IR files with workspace package resolution.
     pub fn build_from_ir_with_workspace(files: &[IrFile], workspace_map: &WorkspaceMap) -> Self {
+        Self::build_from_ir_with_resolver(files, &Resolver::new(workspace_map, &PathAliases::default()))
+    }
+
+    /// IR variant of [`Self::build_with_resolver`].
+    pub fn build_from_ir_with_resolver(files: &[IrFile], workspace_map: &Resolver<'_>) -> Self {
         let mut graph = DiGraph::new();
         let mut id_to_index: HashMap<String, NodeIndex> = HashMap::new();
 
@@ -610,10 +621,41 @@ fn resolve_import_or_workspace(
     import_source: &str,
     importer_path: &str,
     known_files: &[&str],
-    workspace_map: &WorkspaceMap,
+    workspace_map: &Resolver<'_>,
 ) -> Option<String> {
     resolve_import_path(import_source, importer_path, known_files)
-        .or_else(|| resolve_workspace_import(import_source, known_files, workspace_map))
+        .or_else(|| resolve_alias_import(import_source, importer_path, known_files, workspace_map.aliases))
+        .or_else(|| resolve_workspace_import(import_source, known_files, workspace_map.workspace))
+}
+
+/// Resolve a non-relative import through tsconfig `paths` / `baseUrl`.
+fn resolve_alias_import(
+    import_source: &str,
+    importer_path: &str,
+    known_files: &[&str],
+    aliases: &PathAliases,
+) -> Option<String> {
+    for base in aliases.candidates(import_source, importer_path) {
+        for ext in ["", ".ts", ".tsx", ".js", ".jsx", ".py", "/index.ts", "/index.tsx", "/index.js"] {
+            let candidate = format!("{base}{ext}");
+            if known_files.contains(&candidate.as_str()) {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+/// Everything import resolution needs beyond relative paths.
+pub struct Resolver<'a> {
+    pub workspace: &'a WorkspaceMap,
+    pub aliases: &'a PathAliases,
+}
+
+impl<'a> Resolver<'a> {
+    pub fn new(workspace: &'a WorkspaceMap, aliases: &'a PathAliases) -> Self {
+        Resolver { workspace, aliases }
+    }
 }
 
 /// Build a workspace package map by scanning `package.json` files in a directory.
@@ -779,7 +821,7 @@ fn collect_import_edges(
     file_exports: &HashMap<String, Vec<ExportInfo>>,
     file_defs: &HashMap<String, Vec<Definition>>,
     id_to_index: &HashMap<String, NodeIndex>,
-    workspace_map: &WorkspaceMap,
+    workspace_map: &Resolver<'_>,
     edges: &mut Vec<(String, String, EdgeType)>,
 ) {
     let known_paths: Vec<&str> = all_files.iter().map(|f| f.path.as_str()).collect();
@@ -874,7 +916,7 @@ fn collect_call_edges(
     file_exports: &HashMap<String, Vec<ExportInfo>>,
     file_defs: &HashMap<String, Vec<Definition>>,
     id_to_index: &HashMap<String, NodeIndex>,
-    workspace_map: &WorkspaceMap,
+    workspace_map: &Resolver<'_>,
     edges: &mut Vec<(String, String, EdgeType)>,
 ) {
     let known_paths: Vec<&str> = all_files.iter().map(|f| f.path.as_str()).collect();
@@ -958,7 +1000,7 @@ fn build_import_resolution_map(
     _file_exports: &HashMap<String, Vec<ExportInfo>>,
     _file_defs: &HashMap<String, Vec<Definition>>,
     known_paths: &[&str],
-    workspace_map: &WorkspaceMap,
+    workspace_map: &Resolver<'_>,
 ) -> HashMap<String, String> {
     let mut map = HashMap::new();
 
@@ -1072,7 +1114,7 @@ fn collect_ir_import_edges(
     file_defs: &HashMap<String, Vec<(String, SymbolKind)>>,
     id_to_index: &HashMap<String, NodeIndex>,
     known_paths: &[&str],
-    workspace_map: &WorkspaceMap,
+    workspace_map: &Resolver<'_>,
     edges: &mut Vec<(String, String, EdgeType)>,
 ) {
     if !id_to_index.contains_key(&file.path) {
@@ -1169,7 +1211,7 @@ fn build_ir_import_resolution_map(
     all_files: &[IrFile],
     _file_defs: &HashMap<String, Vec<(String, SymbolKind)>>,
     known_paths: &[&str],
-    workspace_map: &WorkspaceMap,
+    workspace_map: &Resolver<'_>,
 ) -> HashMap<String, String> {
     let mut map = HashMap::new();
 
@@ -1226,7 +1268,7 @@ fn collect_ir_call_edges(
     file_defs: &HashMap<String, Vec<(String, SymbolKind)>>,
     id_to_index: &HashMap<String, NodeIndex>,
     known_paths: &[&str],
-    workspace_map: &WorkspaceMap,
+    workspace_map: &Resolver<'_>,
     edges: &mut Vec<(String, String, EdgeType)>,
 ) {
     let import_map =
@@ -1309,7 +1351,7 @@ fn collect_ir_extends_edges(
         all_files,
         &HashMap::new(),
         known_paths,
-        &WorkspaceMap::new(),
+        &Resolver::new(&WorkspaceMap::new(), &PathAliases::default()),
     );
 
     for td in &file.type_defs {
@@ -3166,7 +3208,7 @@ function handlePost(req: any) { createUser(req.body); }
                 "utils".to_string(),
                 "packages/utils/src/index.ts".to_string(),
             );
-            let result = resolve_import_or_workspace("./utils", "src/handler.ts", &known, &ws);
+            let result = resolve_import_or_workspace("./utils", "src/handler.ts", &known, &Resolver::new(&ws, &PathAliases::default()));
             assert_eq!(result, Some("src/utils.ts".to_string()));
         }
 
@@ -3178,7 +3220,7 @@ function handlePost(req: any) { createUser(req.body); }
                 "@app/types".to_string(),
                 "packages/types/src/index.ts".to_string(),
             );
-            let result = resolve_import_or_workspace("@app/types", "src/handler.ts", &known, &ws);
+            let result = resolve_import_or_workspace("@app/types", "src/handler.ts", &known, &Resolver::new(&ws, &PathAliases::default()));
             assert_eq!(result, Some("packages/types/src/index.ts".to_string()));
         }
     }

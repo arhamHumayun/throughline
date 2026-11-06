@@ -250,7 +250,7 @@ pub fn get_python_class_bases(source: &str, class_name: &str) -> Result<Vec<Stri
 pub fn extract_data_flow_info(path: &str, source: &str) -> Result<DataFlowInfo, AstError> {
     let language = Language::from_path(path);
     match language {
-        Language::TypeScript | Language::JavaScript => extract_ts_data_flow(source),
+        Language::TypeScript | Language::JavaScript => extract_ts_data_flow(path, source),
         Language::Python => extract_python_data_flow(source),
         Language::Go => extract_go_data_flow(source),
         Language::Rust
@@ -300,10 +300,22 @@ fn extract_string_content(node: &Node, source: &[u8]) -> Option<String> {
 // TypeScript / JavaScript parsing
 // ---------------------------------------------------------------------------
 
+/// The tree-sitter grammar for a JS/TS path. JSX only parses under the TSX grammar,
+/// which also handles plain JavaScript; `.ts` keeps the TypeScript grammar because
+/// TSX rejects `<T>expr` type assertions.
+fn ts_grammar(path: &str) -> tree_sitter::Language {
+    let lower = path.to_ascii_lowercase();
+    if lower.ends_with(".ts") || lower.ends_with(".mts") || lower.ends_with(".cts") {
+        tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()
+    } else {
+        tree_sitter_typescript::LANGUAGE_TSX.into()
+    }
+}
+
 fn parse_typescript(path: &str, source: &str, lang: Language) -> Result<ParsedFile, AstError> {
     let mut parser = Parser::new();
     parser
-        .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+        .set_language(&ts_grammar(path))
         .map_err(|e| AstError::LanguageError(e.to_string()))?;
 
     let tree = parser
@@ -968,10 +980,10 @@ fn extract_callee(node: &Node, source: &[u8]) -> Option<String> {
 // Data flow extraction: TypeScript / JavaScript
 // ---------------------------------------------------------------------------
 
-fn extract_ts_data_flow(source: &str) -> Result<DataFlowInfo, AstError> {
+fn extract_ts_data_flow(path: &str, source: &str) -> Result<DataFlowInfo, AstError> {
     let mut parser = Parser::new();
     parser
-        .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+        .set_language(&ts_grammar(path))
         .map_err(|e| AstError::LanguageError(e.to_string()))?;
 
     let tree = parser

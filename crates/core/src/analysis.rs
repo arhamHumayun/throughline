@@ -11,7 +11,9 @@ use crate::config::DiffcoreConfig;
 use crate::entrypoint;
 use crate::flow::{self, FlowConfig};
 use crate::git;
-use crate::graph::{self, SymbolGraph};
+use crate::flows::{self, Flows};
+use crate::graph::{self, Resolver, SymbolGraph};
+use crate::tsconfig::PathAliases;
 use crate::output::{self, build_analysis_output};
 use crate::pipeline;
 use crate::rank;
@@ -40,8 +42,17 @@ pub enum AnalysisError {
     BareRepo,
 }
 
+/// Result of one analysis.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Analysis {
+    /// diff-core style groups (kept for comparison while flows mature).
+    pub output: AnalysisOutput,
+    /// Stack-ordered flows: roots are changed code no other changed code calls.
+    pub flows: Flows,
+}
+
 /// Analyze a diff in the repository containing `repo_path`.
-pub fn analyze(repo_path: &Path, spec: &DiffSpec) -> Result<AnalysisOutput, AnalysisError> {
+pub fn analyze(repo_path: &Path, spec: &DiffSpec) -> Result<Analysis, AnalysisError> {
     let repo = Repository::discover(repo_path)?;
     let workdir = repo.workdir().ok_or(AnalysisError::BareRepo)?.to_path_buf();
 
@@ -81,7 +92,10 @@ pub fn analyze(repo_path: &Path, spec: &DiffSpec) -> Result<AnalysisOutput, Anal
     let parsed_files = pipeline::parse_files_parallel(&file_inputs);
 
     let workspace_map = graph::build_workspace_map(&workdir);
-    let mut sym_graph = SymbolGraph::build_with_workspace(&parsed_files, &workspace_map);
+    let paths: Vec<&str> = file_inputs.iter().map(|(p, _)| *p).collect();
+    let aliases = PathAliases::load(&workdir, &paths);
+    let mut sym_graph =
+        SymbolGraph::build_with_resolver(&parsed_files, &Resolver::new(&workspace_map, &aliases));
     let entrypoints = entrypoint::detect_entrypoints(&parsed_files);
     let flow_analysis = flow::analyze_data_flow(&parsed_files, &FlowConfig::default());
     flow::enrich_graph(&mut sym_graph, &flow_analysis);
@@ -98,11 +112,7 @@ pub fn analyze(repo_path: &Path, spec: &DiffSpec) -> Result<AnalysisOutput, Anal
     let rank_inputs = rank::build_rank_inputs(&cluster_result, &file_centrality);
     let ranked = rank::rank_groups(&rank_inputs, &config.ranking);
 
-    Ok(build_analysis_output(
-        &diff_result,
-        diff_source,
-        &parsed_files,
-        &cluster_result,
-        &ranked,
-    ))
+    let flows = flows::compute(&sym_graph, &changed_files);
+    let output = build_analysis_output(&diff_result, diff_source, &parsed_files, &cluster_result, &ranked);
+    Ok(Analysis { output, flows })
 }

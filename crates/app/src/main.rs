@@ -15,10 +15,22 @@ fn init() -> State {
     let var = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
     let (repo, base, head) = (var("DIFFVIEW_REPO", "."), var("DIFFVIEW_BASE", "main"), var("DIFFVIEW_HEAD", "HEAD"));
     match analyze(std::path::Path::new(&repo), &DiffSpec::Refs { base: base.clone(), head: head.clone() }) {
-        Ok(out) => State {
-            title: format!("{} files, {} groups ({base}...{head})", out.summary.total_files_changed, out.groups.len()),
-            lines: out.groups.iter().map(|g| format!("{}  ({} files)", g.name, g.files.len())).collect(),
-        },
+        Ok(a) => {
+            let stem = |p: &str| p.rsplit('/').next().unwrap_or(p).split('.').next().unwrap_or(p).to_string();
+            let f = &a.flows;
+            let mut lines: Vec<String> = f
+                .flows
+                .iter()
+                .map(|fl| format!("{}  ({} files, {} tests)", stem(&fl.root), fl.files.len(), fl.tests.len()))
+                .collect();
+            if !f.standalone.is_empty() {
+                lines.push(format!("Standalone: {}", f.standalone.iter().map(|p| stem(p)).collect::<Vec<_>>().join(", ")));
+            }
+            State {
+                title: format!("{} files, {} flows ({base}...{head})", a.output.summary.total_files_changed, f.flows.len()),
+                lines,
+            }
+        }
         Err(e) => State { title: "diffview".into(), lines: vec![format!("core: {e}")] },
     }
 }
