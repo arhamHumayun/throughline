@@ -2,9 +2,8 @@
 
 Cargo workspace:
 
--  (, bin ): overview window on [Rune](https://github.com/anomalyco/rune) (pinned rev 5521783), wired to core. Repo/refs via env DIFFVIEW_REPO / DIFFVIEW_BASE / DIFFVIEW_HEAD.  renders headless. Linux needs libxkbcommon-dev, libwayland-dev (windowed runs also libxkbcommon-x11-0).
-
--  (, bin ): overview window on [Rune](https://github.com/anomalyco/rune) (pinned rev 5521783), wired to core. Repo/refs via env DIFFVIEW_REPO / DIFFVIEW_BASE / DIFFVIEW_HEAD.  renders headless. Linux needs libxkbcommon-dev, libwayland-dev (windowed runs also libxkbcommon-x11-0).
+- `crates/core` (`diffview-core`): pure data, no UI. git2 diff, tree-sitter IR (TypeScript/JavaScript + Python), symbol graph, entrypoint detection, flow groups, ranking. One call: `diffview_core::analysis::analyze(repo, &DiffSpec::Refs { base, head })`.
+- `crates/app` (`diffview-app`, bin `diffview`): overview window on [Rune](https://github.com/anomalyco/rune) (pinned rev 5521783), wired to core. Repo and refs come from env DIFFVIEW_REPO / DIFFVIEW_BASE / DIFFVIEW_HEAD. `diffview --snap out.png` renders headless. Linux builds need libxkbcommon-dev and libwayland-dev.
 
 ## Provenance
 
