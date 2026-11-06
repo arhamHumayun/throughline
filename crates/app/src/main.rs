@@ -1,8 +1,8 @@
 //! Overview window wired to `core`: lists the flow groups for a diff.
-//! Repo and refs come from env: DIFFVIEW_REPO (default "."), DIFFVIEW_BASE ("main"), DIFFVIEW_HEAD ("HEAD").
-//! `diffview` opens the window; `diffview --snap out.png` renders it headless.
+//! Repo and refs come from env: THROUGHLINE_REPO (default "."), THROUGHLINE_BASE ("main"), THROUGHLINE_HEAD ("HEAD").
+//! `throughline` opens the window; `throughline --snap out.png` renders it headless.
 
-use diffview_core::analysis::{DiffSpec, analyze};
+use throughline_core::analysis::{DiffSpec, analyze};
 use rune::tok::{self, type_};
 use rune::{AppSpec, Cx, El, col, text};
 
@@ -13,7 +13,7 @@ struct State {
 
 fn init() -> State {
     let var = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
-    let (repo, base, head) = (var("DIFFVIEW_REPO", "."), var("DIFFVIEW_BASE", "main"), var("DIFFVIEW_HEAD", "HEAD"));
+    let (repo, base, head) = (var("THROUGHLINE_REPO", "."), var("THROUGHLINE_BASE", "main"), var("THROUGHLINE_HEAD", "HEAD"));
     match analyze(std::path::Path::new(&repo), &DiffSpec::Refs { base: base.clone(), head: head.clone() }) {
         Ok(a) => {
             let stem = |p: &str| p.rsplit('/').next().unwrap_or(p).split('.').next().unwrap_or(p).to_string();
@@ -31,7 +31,7 @@ fn init() -> State {
                 lines,
             }
         }
-        Err(e) => State { title: "diffview".into(), lines: vec![format!("core: {e}")] },
+        Err(e) => State { title: "throughline".into(), lines: vec![format!("core: {e}")] },
     }
 }
 
@@ -52,5 +52,5 @@ fn view(s: &State, _: &mut Cx<State>) -> El {
 }
 
 fn main() {
-    rune::run(AppSpec::<State>::new("diffview", (800.0, 600.0), init, view));
+    rune::run(AppSpec::<State>::new("throughline", (800.0, 600.0), init, view));
 }

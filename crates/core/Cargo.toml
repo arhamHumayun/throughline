@@ -1,12 +1,12 @@
 [package]
-name = "diffview-core"
+name = "throughline-core"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
 description = "Pure-data diff analysis: git diff, tree-sitter symbol graph, entrypoints, flow groups. Strip-mined from diff-core (MIT)."
 
 [lib]
-name = "diffview_core"
+name = "throughline_core"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

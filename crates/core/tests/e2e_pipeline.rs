@@ -19,11 +19,11 @@ mod helpers;
 
 use git2::Repository;
 
-use diffview_core::ast;
-use diffview_core::entrypoint;
-use diffview_core::git;
-use diffview_core::output;
-use diffview_core::types::AnalysisOutput;
+use throughline_core::ast;
+use throughline_core::entrypoint;
+use throughline_core::git;
+use throughline_core::output;
+use throughline_core::types::AnalysisOutput;
 use helpers::graph_assertions::{
     assert_all_files_accounted, assert_json_roundtrip, assert_language_detected,
     assert_valid_json_schema, assert_valid_mermaid, assert_valid_scores,
@@ -235,7 +235,7 @@ fn test_e2e_branch_comparison_metadata() {
 
     assert_eq!(
         output.diff_source.diff_type,
-        diffview_core::types::DiffType::BranchComparison
+        throughline_core::types::DiffType::BranchComparison
     );
     assert_eq!(output.diff_source.base.as_deref(), Some("main"));
     assert_eq!(output.diff_source.head.as_deref(), Some("feature/bump"));
@@ -768,7 +768,7 @@ export default app;
     // Should detect HTTP route entrypoints
     let http_eps: Vec<_> = entrypoints
         .iter()
-        .filter(|e| e.entrypoint_type == diffview_core::types::EntrypointType::HttpRoute)
+        .filter(|e| e.entrypoint_type == throughline_core::types::EntrypointType::HttpRoute)
         .collect();
     assert!(
         !http_eps.is_empty(),
@@ -850,7 +850,7 @@ func BenchmarkGetUser(b *testing.B) {
         .groups
         .iter()
         .flat_map(|g| g.entrypoint.as_ref())
-        .filter(|ep| ep.entrypoint_type == diffview_core::types::EntrypointType::TestFile)
+        .filter(|ep| ep.entrypoint_type == throughline_core::types::EntrypointType::TestFile)
         .collect();
     assert!(
         !test_eps.is_empty(),
@@ -922,7 +922,7 @@ fn test_add_negative() {
         .groups
         .iter()
         .flat_map(|g| g.entrypoint.as_ref())
-        .filter(|ep| ep.entrypoint_type == diffview_core::types::EntrypointType::TestFile)
+        .filter(|ep| ep.entrypoint_type == throughline_core::types::EntrypointType::TestFile)
         .collect();
     assert!(
         !test_eps.is_empty(),
@@ -1009,7 +1009,7 @@ public class UserServiceTest {
         .groups
         .iter()
         .flat_map(|g| g.entrypoint.as_ref())
-        .filter(|ep| ep.entrypoint_type == diffview_core::types::EntrypointType::TestFile)
+        .filter(|ep| ep.entrypoint_type == throughline_core::types::EntrypointType::TestFile)
         .collect();
     assert!(
         !test_eps.is_empty(),
@@ -1095,7 +1095,7 @@ namespace MyApp.Tests
         .groups
         .iter()
         .flat_map(|g| g.entrypoint.as_ref())
-        .filter(|ep| ep.entrypoint_type == diffview_core::types::EntrypointType::TestFile)
+        .filter(|ep| ep.entrypoint_type == throughline_core::types::EntrypointType::TestFile)
         .collect();
     assert!(
         !test_eps.is_empty(),
@@ -1623,7 +1623,7 @@ events = ["src/triggers/**/*.ts"]
     rb.commit("Add triggers with custom config");
 
     // Run pipeline WITH config loaded from repo
-    let config = diffview_core::config::DiffcoreConfig::load_from_dir(rb.path()).unwrap();
+    let config = throughline_core::config::DiffcoreConfig::load_from_dir(rb.path()).unwrap();
 
     // Verify config was loaded and has our custom entrypoints
     assert!(

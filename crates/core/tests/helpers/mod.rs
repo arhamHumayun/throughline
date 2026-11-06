@@ -14,10 +14,10 @@ use std::sync::OnceLock;
 ///
 /// Lazy query compilation per language happens once and is reused by every test
 /// in the same test binary, avoiding redundant `.scm` compilation.
-pub fn shared_engine() -> &'static diffview_core::query_engine::QueryEngine {
-    static ENGINE: OnceLock<diffview_core::query_engine::QueryEngine> = OnceLock::new();
+pub fn shared_engine() -> &'static throughline_core::query_engine::QueryEngine {
+    static ENGINE: OnceLock<throughline_core::query_engine::QueryEngine> = OnceLock::new();
     ENGINE.get_or_init(|| {
-        diffview_core::query_engine::QueryEngine::new().expect("shared QueryEngine init")
+        throughline_core::query_engine::QueryEngine::new().expect("shared QueryEngine init")
     })
 }
 
@@ -25,7 +25,7 @@ pub fn shared_engine() -> &'static diffview_core::query_engine::QueryEngine {
 ///
 /// Content-addressed (SHA-256 of path + source), so no cross-test pollution.
 /// Duplicate fixture files parsed by multiple tests will hit the cache.
-pub fn shared_cache() -> &'static diffview_core::pipeline::IrCache {
-    static CACHE: OnceLock<diffview_core::pipeline::IrCache> = OnceLock::new();
-    CACHE.get_or_init(diffview_core::pipeline::IrCache::new)
+pub fn shared_cache() -> &'static throughline_core::pipeline::IrCache {
+    static CACHE: OnceLock<throughline_core::pipeline::IrCache> = OnceLock::new();
+    CACHE.get_or_init(throughline_core::pipeline::IrCache::new)
 }

@@ -754,7 +754,7 @@ export default router;
     if let Some(ref infra) = output.infrastructure_group {
         if !infra.sub_groups.is_empty() {
             let has_generated_subgroup = infra.sub_groups.iter().any(|sg| {
-                sg.category == diffview_core::types::InfraCategory::Generated
+                sg.category == throughline_core::types::InfraCategory::Generated
                     || sg.files.iter().any(|f| f.contains("generated"))
             });
             if infra.files.iter().any(|f| f.contains("generated")) {

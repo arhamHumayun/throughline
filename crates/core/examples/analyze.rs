@@ -1,6 +1,6 @@
 //! Dev harness, not a user-facing CLI: `cargo run --example analyze -- <repo> <base> <head>`
 #![allow(clippy::print_stdout)]
-use diffview_core::analysis::{analyze, DiffSpec};
+use throughline_core::analysis::{analyze, DiffSpec};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let a: Vec<String> = std::env::args().collect();

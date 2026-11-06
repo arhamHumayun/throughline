@@ -17,16 +17,16 @@
 
 mod helpers;
 
-use diffview_core::ast;
-use diffview_core::cluster;
-use diffview_core::entrypoint;
-use diffview_core::flow::{self, FlowConfig};
-use diffview_core::git;
-use diffview_core::graph::SymbolGraph;
-use diffview_core::output::{self, build_analysis_output};
-use diffview_core::pipeline;
-use diffview_core::rank;
-use diffview_core::types::{AnalysisOutput, GroupRankInput, RankWeights};
+use throughline_core::ast;
+use throughline_core::cluster;
+use throughline_core::entrypoint;
+use throughline_core::flow::{self, FlowConfig};
+use throughline_core::git;
+use throughline_core::graph::SymbolGraph;
+use throughline_core::output::{self, build_analysis_output};
+use throughline_core::pipeline;
+use throughline_core::rank;
+use throughline_core::types::{AnalysisOutput, GroupRankInput, RankWeights};
 use helpers::graph_assertions::{
     assert_all_files_accounted, assert_json_roundtrip, assert_valid_json_schema,
     assert_valid_scores,
@@ -117,9 +117,9 @@ fn run_ir_pipeline(rb: &RepoBuilder, base: &str, head: &str) -> AnalysisOutput {
     let diff_result = git::diff_refs(&repo, base, head).expect("diff_refs failed");
 
     use std::sync::OnceLock;
-    static ENGINE: OnceLock<diffview_core::query_engine::QueryEngine> = OnceLock::new();
+    static ENGINE: OnceLock<throughline_core::query_engine::QueryEngine> = OnceLock::new();
     let engine = ENGINE.get_or_init(|| {
-        diffview_core::query_engine::QueryEngine::new().expect("shared QueryEngine init")
+        throughline_core::query_engine::QueryEngine::new().expect("shared QueryEngine init")
     });
 
     let file_inputs: Vec<(&str, &str)> = diff_result

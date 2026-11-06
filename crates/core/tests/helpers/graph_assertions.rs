@@ -3,7 +3,7 @@
 //! Provides ergonomic assertion functions for common patterns in integration tests,
 //! reducing boilerplate and producing clear error messages.
 
-use diffview_core::types::AnalysisOutput;
+use throughline_core::types::AnalysisOutput;
 
 /// Assert that every changed file is accounted for — either in a flow group or infrastructure.
 pub fn assert_all_files_accounted(output: &AnalysisOutput) {
@@ -75,15 +75,15 @@ pub fn assert_file_in_some_group(output: &AnalysisOutput, path_contains: &str) {
 
 /// Assert that the JSON output roundtrips cleanly (serialize → deserialize → serialize is stable).
 pub fn assert_json_roundtrip(output: &AnalysisOutput) {
-    let json1 = diffview_core::output::to_json(output).unwrap();
+    let json1 = throughline_core::output::to_json(output).unwrap();
     let parsed: AnalysisOutput = serde_json::from_str(&json1).unwrap();
-    let json2 = diffview_core::output::to_json(&parsed).unwrap();
+    let json2 = throughline_core::output::to_json(&parsed).unwrap();
     assert_eq!(json1, json2, "JSON roundtrip not stable");
 }
 
 /// Assert that the output JSON is valid and contains all required top-level fields.
 pub fn assert_valid_json_schema(output: &AnalysisOutput) {
-    let json_str = diffview_core::output::to_json(output).unwrap();
+    let json_str = throughline_core::output::to_json(output).unwrap();
     let v: serde_json::Value = serde_json::from_str(&json_str).unwrap();
 
     assert_eq!(v["version"], "1.0.0");
@@ -148,7 +148,7 @@ pub fn assert_valid_json_schema(output: &AnalysisOutput) {
 /// Assert that Mermaid diagrams are valid for all groups.
 pub fn assert_valid_mermaid(output: &AnalysisOutput) {
     for group in &output.groups {
-        let mermaid = diffview_core::output::generate_mermaid(group);
+        let mermaid = throughline_core::output::generate_mermaid(group);
         assert!(
             mermaid.starts_with("graph TD"),
             "Group '{}' Mermaid should start with 'graph TD', got: {}",

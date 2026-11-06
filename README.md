@@ -1,9 +1,9 @@
-# visual-diff (working name)
+# throughline
 
 Cargo workspace:
 
-- `crates/core` (`diffview-core`): pure data, no UI. git2 diff, tree-sitter IR (TypeScript/JavaScript + Python), symbol graph, entrypoint detection, flow groups, ranking. One call: `diffview_core::analysis::analyze(repo, &DiffSpec::Refs { base, head })`.
-- `crates/app` (`diffview-app`, bin `diffview`): overview window on [Rune](https://github.com/anomalyco/rune) (pinned rev 5521783), wired to core. Repo and refs come from env DIFFVIEW_REPO / DIFFVIEW_BASE / DIFFVIEW_HEAD. `diffview --snap out.png` renders headless. Linux builds need libxkbcommon-dev and libwayland-dev.
+- `crates/core` (`throughline-core`): pure data, no UI. git2 diff, tree-sitter IR (TypeScript/JavaScript + Python), symbol graph, entrypoint detection, flow groups, ranking. One call: `throughline_core::analysis::analyze(repo, &DiffSpec::Refs { base, head })`.
+- `crates/app` (`throughline-app`, bin `throughline`): overview window on [Rune](https://github.com/anomalyco/rune) (pinned rev 5521783), wired to core. Repo and refs come from env THROUGHLINE_REPO / THROUGHLINE_BASE / THROUGHLINE_HEAD. `throughline --snap out.png` renders headless. Linux builds need libxkbcommon-dev and libwayland-dev.
 
 ## Provenance
 
@@ -19,4 +19,4 @@ Strip-mined from [diff-core](https://github.com/jamesaphoenix/diff-core) (MIT) a
 ## Dev
 
     cargo test --release
-    cargo run --release --example analyze --  (, bin ): overview window on [Rune](https://github.com/anomalyco/rune) (pinned rev 5521783), wired to core. Repo/refs via env DIFFVIEW_REPO / DIFFVIEW_BASE / DIFFVIEW_HEAD.  renders headless. Linux needs libxkbcommon-dev, libwayland-dev (windowed runs also libxkbcommon-x11-0).
+    cargo run --release --example analyze --  (, bin ): overview window on [Rune](https://github.com/anomalyco/rune) (pinned rev 5521783), wired to core. Repo/refs via env THROUGHLINE_REPO / THROUGHLINE_BASE / THROUGHLINE_HEAD.  renders headless. Linux needs libxkbcommon-dev, libwayland-dev (windowed runs also libxkbcommon-x11-0).

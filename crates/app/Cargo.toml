@@ -1,14 +1,14 @@
 [package]
-name = "diffview-app"
+name = "throughline-app"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
 
 [[bin]]
-name = "diffview"
+name = "throughline"
 path = "src/main.rs"
 
 [dependencies]
-diffview-core = { path = "../core" }
+throughline-core = { path = "../core" }
 # Pinned rev of rune's `dev` branch (never rewritten). Read rune's crates/rune/README.md at this rev before writing UI code.
 rune = { git = "https://github.com/anomalyco/rune", rev = "55217838ad88551dcb64dba3085c9e96e058bd99" }

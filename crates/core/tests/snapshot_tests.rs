@@ -25,7 +25,7 @@ use helpers::repo_builder::{run_pipeline, RepoBuilder};
 
 /// Convert AnalysisOutput to a serde_json::Value and redact non-deterministic
 /// fields (git SHAs) so snapshots are stable across runs.
-fn snapshot_value(output: &diffview_core::types::AnalysisOutput) -> serde_json::Value {
+fn snapshot_value(output: &throughline_core::types::AnalysisOutput) -> serde_json::Value {
     let mut v: serde_json::Value = serde_json::to_value(output).unwrap();
     // Redact git SHAs — these change on every test run because TempDir paths differ
     if let Some(ds) = v.get_mut("diff_source") {

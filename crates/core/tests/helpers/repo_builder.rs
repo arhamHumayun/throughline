@@ -5,13 +5,13 @@ use std::path::Path;
 use git2::{Repository, Signature, Time};
 use tempfile::TempDir;
 
-use diffview_core::cluster;
-use diffview_core::entrypoint;
-use diffview_core::flow::{self, FlowConfig};
-use diffview_core::graph::SymbolGraph;
-use diffview_core::output::{self, build_analysis_output};
-use diffview_core::rank::{self};
-use diffview_core::types::{AnalysisOutput, RankWeights};
+use throughline_core::cluster;
+use throughline_core::entrypoint;
+use throughline_core::flow::{self, FlowConfig};
+use throughline_core::graph::SymbolGraph;
+use throughline_core::output::{self, build_analysis_output};
+use throughline_core::rank::{self};
+use throughline_core::types::{AnalysisOutput, RankWeights};
 pub struct RepoBuilder {
     dir: TempDir,
     repo: Repository,
@@ -109,13 +109,13 @@ impl Default for RepoBuilder {
 /// Run the full pipeline on a repo diff between two refs.
 pub fn run_pipeline(repo_path: &Path, base_ref: &str, head_ref: &str) -> AnalysisOutput {
     let repo = Repository::open(repo_path).expect("failed to open repo");
-    let diff_result = diffview_core::git::diff_refs(&repo, base_ref, head_ref).expect("diff_refs failed");
+    let diff_result = throughline_core::git::diff_refs(&repo, base_ref, head_ref).expect("diff_refs failed");
 
     // Use shared QueryEngine for parsing — supports all languages including Rust
     use std::sync::OnceLock;
-    static ENGINE: OnceLock<diffview_core::query_engine::QueryEngine> = OnceLock::new();
+    static ENGINE: OnceLock<throughline_core::query_engine::QueryEngine> = OnceLock::new();
     let engine = ENGINE.get_or_init(|| {
-        diffview_core::query_engine::QueryEngine::new().expect("failed to create query engine")
+        throughline_core::query_engine::QueryEngine::new().expect("failed to create query engine")
     });
     let mut parsed_files = Vec::new();
     for file_diff in &diff_result.files {
