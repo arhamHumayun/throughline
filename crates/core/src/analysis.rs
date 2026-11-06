@@ -11,6 +11,7 @@ use crate::config::DiffcoreConfig;
 use crate::entrypoint;
 use crate::flow::{self, FlowConfig};
 use crate::git;
+use crate::naming;
 use crate::flows::{self, Flows};
 use crate::graph::{self, Resolver, SymbolGraph};
 use crate::tsconfig::PathAliases;
@@ -112,7 +113,13 @@ pub fn analyze(repo_path: &Path, spec: &DiffSpec) -> Result<Analysis, AnalysisEr
     let rank_inputs = rank::build_rank_inputs(&cluster_result, &file_centrality);
     let ranked = rank::rank_groups(&rank_inputs, &config.ranking);
 
-    let flows = flows::compute(&sym_graph, &changed_files);
+    let mut flows = flows::compute(&sym_graph, &changed_files);
+    if let DiffSpec::Refs { base, head } = spec {
+        // Naming is best effort: a failure here shouldn't fail the analysis.
+        if let Ok(commits) = naming::commits_between(&repo, base, head) {
+            naming::name_flows(&mut flows.flows, &commits);
+        }
+    }
     let output = build_analysis_output(&diff_result, diff_source, &parsed_files, &cluster_result, &ranked);
     Ok(Analysis { output, flows })
 }

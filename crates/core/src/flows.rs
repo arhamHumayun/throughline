@@ -16,6 +16,10 @@ use crate::graph::SymbolGraph;
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct Flow {
+    /// Plain-language name (see `naming`); the root file's name until named.
+    pub title: String,
+    /// The commit the title came from, if any.
+    pub commit: Option<String>,
     /// The entry file: changed, and called by no other changed source file.
     pub root: String,
     /// Changed source files reachable from `root`, root first, in BFS order.
@@ -145,7 +149,13 @@ pub fn compute(graph: &SymbolGraph, changed: &[String]) -> Flows {
 
     let mut flows: Vec<Flow> = roots
         .iter()
-        .map(|r| Flow { root: r.to_string(), files: reach(r), tests: Vec::new() })
+        .map(|r| Flow {
+            title: crate::naming::root_title(r),
+            commit: None,
+            root: r.to_string(),
+            files: reach(r),
+            tests: Vec::new(),
+        })
         .collect();
 
     let mut orphan_tests = Vec::new();
