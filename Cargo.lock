@@ -3037,6 +3037,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rune-kit"
+version = "0.0.1"
+source = "git+https://github.com/anomalyco/rune?rev=55217838ad88551dcb64dba3085c9e96e058bd99#55217838ad88551dcb64dba3085c9e96e058bd99"
+dependencies = [
+ "rune",
+ "rune-motion",
+ "unicode-segmentation",
+]
+
+[[package]]
 name = "rune-motion"
 version = "0.1.0"
 source = "git+https://github.com/anomalyco/rune?rev=55217838ad88551dcb64dba3085c9e96e058bd99#55217838ad88551dcb64dba3085c9e96e058bd99"
@@ -3641,7 +3651,9 @@ dependencies = [
 name = "throughline-app"
 version = "0.1.0"
 dependencies = [
+ "git2",
  "rune",
+ "rune-kit",
  "throughline-core",
 ]
 

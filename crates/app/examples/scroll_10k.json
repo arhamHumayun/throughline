@@ -1,0 +1,8 @@
+[
+  {"t": 0.2, "type": "scroll", "x": 600, "y": 400, "dy": -6000, "dur": 1.0},
+  {"t": 1.4, "type": "scroll", "x": 600, "y": 400, "dy": -20000, "dur": 1.0, "fling": true},
+  {"t": 3.0, "type": "scroll", "x": 600, "y": 400, "dy": 9000, "dur": 0.8},
+  {"t": 4.2, "type": "key", "name": "j"},
+  {"t": 4.4, "type": "key", "name": "j"},
+  {"t": 5.0, "type": "mark", "name": "end"}
+]

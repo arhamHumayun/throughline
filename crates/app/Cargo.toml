@@ -10,5 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 throughline-core = { path = "../core" }
+git2 = { version = "0.20", default-features = false }
 # Pinned rev of rune's `dev` branch (never rewritten). Read rune's crates/rune/README.md at this rev before writing UI code.
 rune = { git = "https://github.com/anomalyco/rune", rev = "55217838ad88551dcb64dba3085c9e96e058bd99" }
+rune-kit = { git = "https://github.com/anomalyco/rune", rev = "55217838ad88551dcb64dba3085c9e96e058bd99" }
