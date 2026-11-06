@@ -26,6 +26,20 @@ pub struct Flow {
     pub files: Vec<String>,
     /// Changed tests/stories that call into this flow's files.
     pub tests: Vec<String>,
+    /// The call tree from `root`, depth first: each file under the first file that calls it.
+    pub tree: Vec<TreeNode>,
+}
+
+/// One line of a flow's call tree.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct TreeNode {
+    pub file: String,
+    /// 0 for the root.
+    pub depth: usize,
+    /// Symbols of `file` that its parent calls (empty for the root).
+    pub via: Vec<String>,
+    /// Already shown earlier in the tree; listed again, not expanded.
+    pub repeat: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Default, PartialEq)]
@@ -78,12 +92,18 @@ pub fn compute(graph: &SymbolGraph, changed: &[String]) -> Flows {
         changed_set.contains(f.as_str()).then_some(f)
     };
 
-    // File-level adjacency among changed files (BTree for deterministic order).
+    // File-level adjacency among changed files (BTree for deterministic order),
+    // and which symbols of the callee each edge reaches.
     let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut via: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
     for (from, to, _) in graph.edges() {
         if let (Some(a), Some(b)) = (file_of(from), file_of(to)) {
             if a != b {
-                out.entry(a).or_default().insert(b);
+                out.entry(a.clone()).or_default().insert(b.clone());
+                let name = graph.get_symbol(to).map(|s| s.name.clone());
+                if let Some(n) = name.filter(|n| !n.is_empty() && n.as_str() != b.as_str()) {
+                    via.entry((a, b)).or_default().insert(n);
+                }
             }
         }
     }
@@ -147,6 +167,24 @@ pub fn compute(graph: &SymbolGraph, changed: &[String]) -> Flows {
         covered.extend(reach(seed));
     }
 
+    let tree = |root: &str| -> Vec<TreeNode> {
+        let mut seen = BTreeSet::new();
+        let mut nodes = Vec::new();
+        // Depth-first; push children in reverse so they pop in order.
+        let mut stack = vec![(root.to_string(), 0usize, Vec::new())];
+        while let Some((file, depth, v)) = stack.pop() {
+            let repeat = !seen.insert(file.clone());
+            if !repeat {
+                for c in callees(&file).into_iter().rev() {
+                    let names = via.get(&(file.clone(), c.to_string())).map(|s| s.iter().cloned().collect()).unwrap_or_default();
+                    stack.push((c.to_string(), depth + 1, names));
+                }
+            }
+            nodes.push(TreeNode { file, depth, via: v, repeat });
+        }
+        nodes
+    };
+
     let mut flows: Vec<Flow> = roots
         .iter()
         .map(|r| Flow {
@@ -155,6 +193,7 @@ pub fn compute(graph: &SymbolGraph, changed: &[String]) -> Flows {
             root: r.to_string(),
             files: reach(r),
             tests: Vec::new(),
+            tree: tree(r),
         })
         .collect();
 
@@ -233,6 +272,20 @@ mod tests {
         assert_eq!(f.flows[0].files, s(&["src/api.ts", "src/svc.ts", "src/db.ts"]));
         assert_eq!(f.flows[0].tests, s(&["src/__tests__/svc.test.ts"]));
         assert_eq!(f.standalone, s(&["src/lone.ts"]));
+        let tree: Vec<(&str, usize)> = f.flows[0].tree.iter().map(|n| (n.file.as_str(), n.depth)).collect();
+        assert_eq!(tree, [("src/api.ts", 0), ("src/svc.ts", 1), ("src/db.ts", 2)]);
+    }
+
+    #[test]
+    fn tree_lists_a_file_again_under_a_second_caller_without_expanding_it() {
+        let g = graph(&[("a.ts", "b.ts"), ("a.ts", "c.ts"), ("b.ts", "c.ts"), ("c.ts", "d.ts")]);
+        let f = compute(&g, &s(&["a.ts", "b.ts", "c.ts", "d.ts"]));
+        let tree: Vec<(&str, usize, bool)> =
+            f.flows[0].tree.iter().map(|n| (n.file.as_str(), n.depth, n.repeat)).collect();
+        assert_eq!(
+            tree,
+            [("a.ts", 0, false), ("b.ts", 1, false), ("c.ts", 2, false), ("d.ts", 3, false), ("c.ts", 1, true)]
+        );
     }
 
     #[test]

@@ -161,6 +161,7 @@ mod tests {
             root: root.into(),
             files: files.iter().map(|s| s.to_string()).collect(),
             tests: vec![],
+            tree: vec![],
             title: String::new(),
             commit: None,
         }
