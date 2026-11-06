@@ -1,63 +1,44 @@
-//! GPUI hello world wired to `core`: opens a window listing the flow groups
-//! for the repo you launch it in (main...HEAD by default).
-//! Dev args: diffview [repo] [base] [head]
+//! Overview window wired to `core`: lists the flow groups for a diff.
+//! Repo and refs come from env: DIFFVIEW_REPO (default "."), DIFFVIEW_BASE ("main"), DIFFVIEW_HEAD ("HEAD").
+//! `diffview` opens the window; `diffview --snap out.png` renders it headless.
 
-use diffview_core::analysis::{analyze, DiffSpec};
-use gpui::{
-    div, prelude::*, px, rgb, size, App, Bounds, Context, SharedString, Window, WindowBounds,
-    WindowOptions,
-};
-use gpui_platform::application;
+use diffview_core::analysis::{DiffSpec, analyze};
+use rune::tok::{self, type_};
+use rune::{AppSpec, Cx, El, col, text};
 
-struct Overview {
-    title: SharedString,
-    lines: Vec<SharedString>,
+struct State {
+    title: String,
+    lines: Vec<String>,
 }
 
-impl Render for Overview {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .p_4()
-            .size_full()
-            .bg(rgb(0x1e1e1e))
-            .text_color(rgb(0xe0e0e0))
-            .child(div().text_xl().child(self.title.clone()))
-            .children(self.lines.iter().map(|l| div().child(l.clone())))
-    }
-}
-
-fn load(args: &[String]) -> (SharedString, Vec<SharedString>) {
-    let repo = args.get(1).cloned().unwrap_or_else(|| ".".into());
-    let base = args.get(2).cloned().unwrap_or_else(|| "main".into());
-    let head = args.get(3).cloned().unwrap_or_else(|| "HEAD".into());
+fn init() -> State {
+    let var = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
+    let (repo, base, head) = (var("DIFFVIEW_REPO", "."), var("DIFFVIEW_BASE", "main"), var("DIFFVIEW_HEAD", "HEAD"));
     match analyze(std::path::Path::new(&repo), &DiffSpec::Refs { base: base.clone(), head: head.clone() }) {
-        Ok(out) => (
-            format!("{} files, {} groups ({base}...{head})", out.summary.total_files_changed, out.groups.len()).into(),
-            out.groups
-                .iter()
-                .map(|g| format!("{}  ({} files)", g.name, g.files.len()).into())
-                .collect(),
-        ),
-        Err(e) => ("Hello from diffview".into(), vec![format!("core: {e}").into()]),
+        Ok(out) => State {
+            title: format!("{} files, {} groups ({base}...{head})", out.summary.total_files_changed, out.groups.len()),
+            lines: out.groups.iter().map(|g| format!("{}  ({} files)", g.name, g.files.len())).collect(),
+        },
+        Err(e) => State { title: "diffview".into(), lines: vec![format!("core: {e}")] },
     }
+}
+
+fn view(s: &State, _: &mut Cx<State>) -> El {
+    let t = tok::theme(true);
+    let mut list = col().gap(8.0);
+    for l in &s.lines {
+        list = list.child(text(l.as_str()).color(t.text));
+    }
+    col()
+        .w_full()
+        .h_full()
+        .padding(16.0)
+        .gap(12.0)
+        .fill(t.bg)
+        .child(text(s.title.as_str()).font(type_::TITLE).color(t.text))
+        .child(list)
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    let (title, lines) = load(&args);
-    application().run(move |cx: &mut App| {
-        let bounds = Bounds::centered(None, size(px(800.), px(600.)), cx);
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                ..Default::default()
-            },
-            |_, cx| cx.new(|_| Overview { title, lines }),
-        )
-        .expect("open window");
-        cx.activate(true);
-    });
+    rune::run(AppSpec::<State>::new("diffview", (800.0, 600.0), init, view));
 }
