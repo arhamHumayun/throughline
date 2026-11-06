@@ -82,7 +82,18 @@ pub fn is_test_or_story(path: &str) -> bool {
 }
 
 /// Compute flows over `changed` files using file-level edges from `graph`.
+/// Siblings in each tree are in path order; see [`compute_ordered`] for call order.
 pub fn compute(graph: &SymbolGraph, changed: &[String]) -> Flows {
+    compute_ordered(graph, changed, &|_, _| None)
+}
+
+/// As [`compute`], with each tree's siblings sorted by `first_use(parent, symbols)`: the
+/// line where `parent` first uses any of `symbols`. Siblings it can't place go last, in path order.
+pub fn compute_ordered(
+    graph: &SymbolGraph,
+    changed: &[String],
+    first_use: &dyn Fn(&str, &[String]) -> Option<usize>,
+) -> Flows {
     let changed_set: BTreeSet<&str> = changed.iter().map(String::as_str).collect();
     let file_of = |id: &str| -> Option<String> {
         let f = graph
@@ -175,9 +186,17 @@ pub fn compute(graph: &SymbolGraph, changed: &[String]) -> Flows {
         while let Some((file, depth, v)) = stack.pop() {
             let repeat = !seen.insert(file.clone());
             if !repeat {
-                for c in callees(&file).into_iter().rev() {
-                    let names = via.get(&(file.clone(), c.to_string())).map(|s| s.iter().cloned().collect()).unwrap_or_default();
-                    stack.push((c.to_string(), depth + 1, names));
+                let mut kids: Vec<(String, Vec<String>)> = callees(&file)
+                    .into_iter()
+                    .map(|c| {
+                        let names = via.get(&(file.clone(), c.to_string())).map(|s| s.iter().cloned().collect()).unwrap_or_default();
+                        (c.to_string(), names)
+                    })
+                    .collect();
+                // Stable: unplaced siblings keep path order, after the placed ones.
+                kids.sort_by_key(|(_, names)| first_use(&file, names).unwrap_or(usize::MAX));
+                for (c, names) in kids.into_iter().rev() {
+                    stack.push((c, depth + 1, names));
                 }
             }
             nodes.push(TreeNode { file, depth, via: v, repeat });
@@ -274,6 +293,20 @@ mod tests {
         assert_eq!(f.standalone, s(&["src/lone.ts"]));
         let tree: Vec<(&str, usize)> = f.flows[0].tree.iter().map(|n| (n.file.as_str(), n.depth)).collect();
         assert_eq!(tree, [("src/api.ts", 0), ("src/svc.ts", 1), ("src/db.ts", 2)]);
+    }
+
+    #[test]
+    fn tree_siblings_follow_first_use_in_the_parent() {
+        let g = graph(&[("a.ts", "b.ts"), ("a.ts", "c.ts"), ("a.ts", "d.ts")]);
+        // Edges to module nodes carry the file stem as the symbol.
+        let line = |_: &str, names: &[String]| match names.first().map(String::as_str) {
+            Some("c") => Some(3),
+            Some("b") => Some(9),
+            _ => None,
+        };
+        let f = compute_ordered(&g, &s(&["a.ts", "b.ts", "c.ts", "d.ts"]), &line);
+        let order: Vec<&str> = f.flows[0].tree.iter().map(|n| n.file.as_str()).collect();
+        assert_eq!(order, ["a.ts", "c.ts", "b.ts", "d.ts"]);
     }
 
     #[test]

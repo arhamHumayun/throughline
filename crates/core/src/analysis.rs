@@ -53,6 +53,9 @@ pub struct Analysis {
 }
 
 /// Analyze a diff in the repository containing `repo_path`.
+/// Offset that sorts import-only uses after every call site.
+const IMPORT_ONLY: usize = 1 << 32;
+
 pub fn analyze(repo_path: &Path, spec: &DiffSpec) -> Result<Analysis, AnalysisError> {
     let repo = Repository::discover(repo_path)?;
     let workdir = repo.workdir().ok_or(AnalysisError::BareRepo)?.to_path_buf();
@@ -113,7 +116,35 @@ pub fn analyze(repo_path: &Path, spec: &DiffSpec) -> Result<Analysis, AnalysisEr
     let rank_inputs = rank::build_rank_inputs(&cluster_result, &file_centrality);
     let ranked = rank::rank_groups(&rank_inputs, &config.ranking);
 
-    let mut flows = flows::compute(&sym_graph, &changed_files);
+    // Order each tree's siblings by where the parent first uses them: the first call
+    // (JSX counts) of any symbol the edge reaches. Siblings never called (types, constants)
+    // follow all called ones, in import order.
+    let by_path: std::collections::HashMap<&str, &crate::ast::ParsedFile> =
+        parsed_files.iter().map(|f| (f.path.as_str(), f)).collect();
+    let first_use = |parent: &str, names: &[String]| -> Option<usize> {
+        let f = by_path.get(parent)?;
+        // Local names: the symbols themselves, plus any alias the parent imports them under.
+        let mut local: Vec<&str> = names.iter().map(String::as_str).collect();
+        for i in &f.imports {
+            for n in &i.names {
+                if let Some(a) = n.alias.as_deref().filter(|_| names.contains(&n.name)) {
+                    local.push(a);
+                }
+            }
+        }
+        let hit = |callee: &str| {
+            let last = callee.rsplit(['.', ':']).next().unwrap_or(callee);
+            local.iter().any(|n| *n == callee || *n == last)
+        };
+        f.call_sites.iter().filter(|c| hit(&c.callee)).map(|c| c.line).min().or_else(|| {
+            f.imports
+                .iter()
+                .filter(|i| i.names.iter().any(|n| names.iter().any(|m| *m == n.name || Some(m) == n.alias.as_ref())))
+                .map(|i| IMPORT_ONLY + i.line)
+                .min()
+        })
+    };
+    let mut flows = flows::compute_ordered(&sym_graph, &changed_files, &first_use);
     if let DiffSpec::Refs { base, head } = spec {
         // Naming is best effort: a failure here shouldn't fail the analysis.
         if let Ok(commits) = naming::commits_between(&repo, base, head) {
